@@ -152,6 +152,37 @@ async def test_cem_discovers_evse_and_ev(cem_and_evse):
     assert ucs["EVCC"].charge_state(None) == "unplugged"
 
 
+def _empty_permitted_values(evse) -> None:
+    """Like the 1st gen Elli right after plug-in: permitted value sets without values."""
+    f = evse.ev.feature("ElectricalConnection", "server")
+    f.set_data("electricalConnectionPermittedValueSetListData", {
+        "electricalConnectionPermittedValueSetData": [
+            {"electricalConnectionId": 0, "parameterId": 0, "permittedValueSet": [{}]},
+            {"electricalConnectionId": 0, "parameterId": 1},
+            {"electricalConnectionId": 0, "parameterId": 2},
+            {"electricalConnectionId": 0, "parameterId": 3}]})
+
+
+async def test_empty_permitted_values_are_unknown_not_zero(cem_and_evse):
+    """ha-elli #4: an empty permitted value set must not read as a maximum of 0 A."""
+    cem, evse, ucs, _events = cem_and_evse
+    remote = await wait_for(lambda: next(iter(cem.remote_devices.values()), None))
+    await wait_for(lambda: next((e for e in remote.entities if e.type == "EVSE"), None))
+    evse.plug_in()
+    ev = await wait_for(lambda: remote.entity((1, 1)))
+    await wait_for(lambda: ucs["OPEV"].current_limits(ev))
+    _empty_permitted_values(evse)
+
+    def unknown() -> bool:
+        try:
+            ucs["OPEV"].current_limits(ev)
+        except DataNotAvailable:
+            return True
+        return False
+
+    assert await wait_for(unknown), "no maximum is not 0 A"
+
+
 async def test_an_empty_measurement_item_does_not_hide_the_value(cem_and_evse):
     """A full read without valueType plus a partial notify with it leaves two items per
     id (seen on Elli Gen 1, ha-elli #3): the one with the value counts, in any order."""

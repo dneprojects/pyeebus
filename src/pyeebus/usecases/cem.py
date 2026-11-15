@@ -384,8 +384,12 @@ class _LimitUseCase(UseCase):
                 low, high, default = permitted_values(self.local, entity, param["parameterId"])
             except (DataNotAvailable, KeyError):
                 continue
+            if high is None:
+                # An empty permitted value set: the 1st gen Elli sends these right after
+                # plug-in. A missing maximum is unknown, not 0 A (ha-elli #4).
+                continue
             lows.append(low or 0.0)
-            highs.append(high or 0.0)
+            highs.append(high)
             defaults.append(default or 0.0)
         if not lows:
             raise DataNotAvailable("no current limits")
@@ -406,6 +410,8 @@ class _LimitUseCase(UseCase):
                 try:
                     value = permitted_values(self.local, entity, param.get("parameterId"))[1]
                 except DataNotAvailable:
+                    continue
+                if value is None:
                     continue
             result.append(PhaseLimit(phase, value or 0.0, bool(item.get("isLimitActive")),
                                      bool(item.get("isLimitChangeable"))))
