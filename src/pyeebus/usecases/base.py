@@ -273,7 +273,8 @@ class UseCase:
 
     # remote entities
     def is_compatible(self, entity: RemoteEntity | None) -> bool:
-        return entity is not None and entity.type in self.valid_entity_types
+        # no valid entity types: any entity (as eebus-go with nil)
+        return entity is not None and (not self.valid_entity_types or entity.type in self.valid_entity_types)
 
     def scenarios_for(self, entity: RemoteEntity) -> list[int]:
         for item in self.remote_scenarios:
@@ -334,7 +335,7 @@ class UseCase:
                 if not entities:
                     entities = list(device.entities)
                 for entity in entities:
-                    if entity.type not in self.valid_entity_types:
+                    if self.valid_entity_types and entity.type not in self.valid_entity_types:
                         continue
                     available = []
                     for scenario in self.scenarios:

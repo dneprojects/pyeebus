@@ -25,6 +25,12 @@ from pyeebus.usecases import (
     DataNotAvailable,
     LoadLimit,
     LPCState,
+    MonitorCurrentConfig,
+    MonitorEnergyConfig,
+    MonitorFrequencyConfig,
+    MonitorPowerConfig,
+    MonitorVoltageConfig,
+    MuMPC,
     PhaseLimit,
 )
 
@@ -287,6 +293,49 @@ async def test_eebus_go_energy_guard_controls_pyeebus_cs():
         assert await harness.expect("WRITE_RESULT") == "WRITE_RESULT 0"
         assert await wait_for(lambda: lpc.state == LPCState.LIMITED)
         assert lpc.effective_limit() == 3000
+    finally:
+        lpc.close()
+        await cs.stop()
+        await harness.stop()
+
+
+async def test_eebus_go_monitoring_appliance_reads_pyeebus_mu():
+    """eebus-go ma/mpc (in the Energy Guard harness) <- pyeebus MU-MPC, next to CS-LPC."""
+    cs = EebusService(Identity.create("mu"), brand="pyeebus", model="TestMU", serial="1", port=0,
+                      device_type="HeatPumpAppliance", entity_types=("HeatPumpAppliance",), **NODE)
+    abc = {"a": "measuredValue", "b": "measuredValue", "c": "measuredValue"}
+    mpc = MuMPC(cs.entities[0], power=MonitorPowerConfig("abc", "measuredValue", abc),
+                energy=MonitorEnergyConfig("measuredValue", "calculatedValue"),
+                current=MonitorCurrentConfig(abc), voltage=MonitorVoltageConfig(abc),
+                frequency=MonitorFrequencyConfig()).setup()
+    lpc = CsLPC(cs.entities[0], failsafe_limit=4200).setup()  # after MPC, as in eebus-go
+    lpc.set_consumption_nominal_max(9000)
+    mpc.update(power_total=3000, power_per_phase={"a": 1000, "b": 1000, "c": 1000}, energy_consumed=12345,
+               energy_produced=10, current_per_phase={"a": 13, "b": 13, "c": 13},
+               voltage_per_phase={"a": 230, "b": 231, "c": 232}, frequency=50)
+    port = free_port()
+    harness = await start_harness("eg", cs.ski, port)
+    try:
+        go_ski = (await harness.expect("SKI")).split()[1]
+        cs.trust(go_ski)
+        await cs.start()
+        await cs.node.connect("127.0.0.1", port, go_ski)
+
+        assert await harness.expect("EG_ENTITY") == "EG_ENTITY HeatPumpAppliance"
+        assert await harness.expect("MPC_POWER ") == "MPC_POWER 3000"
+        assert await harness.expect("MPC_POWER_PHASES") == "MPC_POWER_PHASES 1000,1000,1000"
+        assert await harness.expect("MPC_ENERGY_CONSUMED") == "MPC_ENERGY_CONSUMED 12345"
+        assert await harness.expect("MPC_ENERGY_PRODUCED") == "MPC_ENERGY_PRODUCED 10"
+        assert await harness.expect("MPC_CURRENT") == "MPC_CURRENT 13,13,13"
+        assert await harness.expect("MPC_VOLTAGE") == "MPC_VOLTAGE 230,231,232"
+        assert await harness.expect("MPC_FREQUENCY") == "MPC_FREQUENCY 50"
+        # the nominal max refers to the MPC's electrical connection (1); eebus-go's guard only
+        # announces it for connection 0, but reads it
+        await harness.send("nominal")
+        assert await harness.expect("EG_NOMINAL_MAX") == "EG_NOMINAL_MAX 9000"
+
+        mpc.update(power_total=6000)
+        await harness.expect("MPC_POWER 6000")
     finally:
         lpc.close()
         await cs.stop()
