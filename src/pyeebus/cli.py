@@ -237,7 +237,7 @@ async def connect(ski: str, host: str | None, port: int, local_port: int, config
     limit_written: set = set()
 
     def read_everything(device: RemoteDevice) -> None:
-        for entity in device.entities[1:]:
+        for entity in device.entities:  # incl. [0] (DeviceClassification), NodeManagement is special
             for feature in entity.features:
                 local = cem.feature(feature.type, Role.CLIENT)
                 if feature.role != Role.SERVER or local is None:
