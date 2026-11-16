@@ -6,10 +6,12 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
+from .probe import ProbeFiles
 from .service import EebusService
 from .ship import Identity, RemoteAbortError, State, TrustStore, is_ski_valid, normalize_ski
 from .ship.mdns import ShipMdns, ShipService
@@ -32,6 +34,38 @@ from .usecases import (
 
 CONFIG_DIR = Path.home() / ".config" / "pyeebus"
 
+# client features of the read-only probe: everything a device may serve
+PROBE_FEATURES = (
+    "Alarm", "Bill", "DeviceClassification", "DeviceConfiguration", "DeviceDiagnosis", "DirectControl",
+    "ElectricalConnection", "HVAC", "Identification", "IncentiveTable", "LoadControl", "Measurement",
+    "Messaging", "PowerSequences", "Sensing", "Setpoint", "SmartEnergyManagementPs", "TariffInformation",
+    "Threshold", "TimeInformation", "TimeSeries", "TimeTable")
+
+
+def interface_address(name: str) -> str:
+    """The IPv4 address of a network interface (e.g. ``ovs_eth0`` on a Synology NAS)."""
+    import ifaddr
+
+    for adapter in ifaddr.get_adapters():
+        if name in (adapter.name, adapter.nice_name):
+            for ip in adapter.ips:
+                if isinstance(ip.ip, str):
+                    return ip.ip
+    raise SystemExit(f"interface {name!r} not found or without IPv4 address; available: "
+                     + ", ".join(a.nice_name for a in ifaddr.get_adapters()))
+
+
+def _zeroconf(interface: str | None):
+    """mDNS bound to one interface (and announcing only its address), or None for all."""
+    if not interface:
+        return None
+    from zeroconf.asyncio import AsyncZeroconf
+
+    address = interface_address(interface)
+    os.environ["EEBUS_ANNOUNCE_IP"] = address
+    print(f"Interface {interface}: {address}")
+    return AsyncZeroconf(interfaces=[address])
+
 
 def _print_service(s: ShipService) -> None:
     print(f"- {s.brand} {s.model} ({s.device_type})".strip())
@@ -41,8 +75,8 @@ def _print_service(s: ShipService) -> None:
     print(f"    register {s.register}")
 
 
-async def discover(seconds: float) -> int:
-    mdns = ShipMdns()
+async def discover(seconds: float, interface: str | None = None) -> int:
+    mdns = ShipMdns(_zeroconf(interface))
     await mdns.browse()
     print(f"Looking for EEBUS devices for {seconds:g} s ...")
     await asyncio.sleep(seconds)
@@ -69,10 +103,14 @@ def _entity_line(entity: RemoteEntity) -> str:
         "\n" + "\n".join(features) if features else "")
 
 
+def _device_text(device: RemoteDevice) -> str:
+    lines = [f"SPINE device {device.address} ({device.device_type}, feature set {device.feature_set})"]
+    lines += [_entity_line(entity) for entity in device.entities]
+    return "\n".join(lines)
+
+
 def _print_device(device: RemoteDevice) -> None:
-    print(f"\nSPINE device {device.address} ({device.device_type}, feature set {device.feature_set})")
-    for entity in device.entities:
-        print(_entity_line(entity))
+    print("\n" + _device_text(device))
 
 
 def _use_cases_text(device: RemoteDevice) -> str:
@@ -150,14 +188,22 @@ def _status(ucs: dict[str, UseCase], entity: RemoteEntity) -> str:
 async def connect(ski: str, host: str | None, port: int, local_port: int, config: Path,
                   raw: bool, read_all: bool = False, lpc_limit: float | None = None,
                   lpc_duration: float = 300, write_failsafe: float | None = None,
-                  lpc_release: bool = False) -> int:
+                  lpc_release: bool = False, read_only: bool = False, interface: str | None = None,
+                  trace_file: Path | None = None, report: Path | None = None) -> int:
     identity = Identity.load_or_create(config, "pyeebus")
     trust = TrustStore.load(config / "trust.json")
+    zeroconf = _zeroconf(interface)
+    node_options: dict[str, Any] = {"zeroconf": zeroconf} if zeroconf else {}
     service = EebusService(identity, brand="pyeebus", model="pyeebus-cli", serial=identity.ski[:8],
                            ship_id=f"pyeebus-{identity.ski[:8]}", port=local_port, trust=trust,
-                           auto_connect=host is None)
+                           auto_connect=host is None, **node_options)
     cem = service.entities[0]
     last: dict[tuple, str] = {}
+    files = None
+    if trace_file or report:
+        files = ProbeFiles(trace_file, report, identity.ski, ski,
+                           f"read-only {read_only}, read-all {read_all}, interface {interface or 'all'}, "
+                           f"local port {local_port}")
 
     def on_uc_event(_ski: str, entity: RemoteEntity | None, name: str) -> None:
         if entity is None or name == UseCase.USE_CASE_SUPPORT_UPDATE:
@@ -176,7 +222,15 @@ async def connect(ski: str, host: str | None, port: int, local_port: int, config
             last[key] = line
             print(f"  {entity.type} [{'.'.join(map(str, entity.entity))}]: {line}")
 
-    ucs = {cls.__name__: cls(cem, on_uc_event).setup() for cls in (*ALL_EV_USE_CASES, LPC, MPC)}
+    if read_only:
+        # no use cases (nothing the device could act on), no bindings, no writes: only
+        # client features to read and subscribe whatever the device serves
+        ucs: dict[str, UseCase] = {}
+        for feature_type in PROBE_FEATURES:
+            cem.add_feature(feature_type, Role.CLIENT)
+        read_all = True
+    else:
+        ucs = {cls.__name__: cls(cem, on_uc_event).setup() for cls in (*ALL_EV_USE_CASES, LPC, MPC)}
     if read_all:
         cem.add_feature("Bill", Role.CLIENT)
     printed: set[tuple] = set()
@@ -191,6 +245,15 @@ async def connect(ski: str, host: str | None, port: int, local_port: int, config
                 for fn, ops in feature.operations.items():
                     if ops.read:
                         local.read(feature, fn)
+                if read_only and not local.has_subscription(feature):
+                    spawn(subscribe(local, feature))
+
+    async def subscribe(local, feature) -> None:
+        try:
+            await local.subscribe(feature)
+        except Exception as err:  # noqa: BLE001
+            print(f"  subscription to {feature.type} [{'.'.join(map(str, feature.entity.entity))}] "
+                  f"failed: {err!r}")
 
     async def write_limit(entity: RemoteEntity) -> None:
         try:
@@ -237,8 +300,27 @@ async def connect(ski: str, host: str | None, port: int, local_port: int, config
             print(f"  failsafe limit {write_failsafe:g} W failed: {err!r}")
 
     def on_spine_event(event: Event) -> None:
+        if (files and event.type == EventType.DATA and event.feature and event.classifier in ("reply", "notify")
+                and event.function != "deviceDiagnosisHeartbeatData"):
+            f = event.feature
+            files.data_update(f"[{'.'.join(map(str, f.entity.entity))}]:{f.id} {f.type}", event.function or "",
+                              event.classifier, event.data)
+        if (read_only and event.type == EventType.DATA and event.classifier == "notify" and event.feature
+                and event.function not in ("deviceDiagnosisHeartbeatData", "nodeManagementUseCaseData")):
+            f = event.feature
+            print(f"  notify [{'.'.join(map(str, f.entity.entity))}]:{f.id} {f.type} {event.function} = "
+                  f"{json.dumps(event.data, separators=(',', ':'))}")
+        if event.type == EventType.DATA and event.function == "nodeManagementUseCaseData" and event.device:
+            text = _use_cases_text(event.device)
+            if last.get(("use cases", event.device.ski)) != text:
+                last[("use cases", event.device.ski)] = text
+                print("\n" + text)
+                if files:
+                    files.set_use_cases(text)
         if event.type == EventType.DEVICE and event.change == Change.ADD and event.device:
             _print_device(event.device)
+            if files:
+                files.set_device(_device_text(event.device))
             if read_all:
                 read_everything(event.device)
         elif (read_all and event.type == EventType.DATA and event.classifier == "reply" and event.feature
@@ -253,24 +335,28 @@ async def connect(ski: str, host: str | None, port: int, local_port: int, config
         elif event.type == EventType.ENTITY and event.entity and event.change == Change.ADD:
             if event.device and event.device.address and len(event.entity.entity) > 1:
                 print("\nEntity added:\n" + _entity_line(event.entity))
+                if files:
+                    files.set_device(_device_text(event.device))
         elif event.type == EventType.ENTITY and event.entity and event.change == Change.REMOVE:
             print(f"\nEntity removed: {event.entity.type} {list(event.entity.entity)}")
-        elif event.type == EventType.DATA and event.function == "nodeManagementUseCaseData" and event.device:
-            text = _use_cases_text(event.device)
-            if last.get(("use cases", event.device.ski)) != text:
-                last[("use cases", event.device.ski)] = text
-                print("\n" + text)
 
     service.device.subscribe_events(on_spine_event)
-    if raw:
-        service.trace = lambda _ski, direction, payload: print(
-            f"{'<<' if direction == 'in' else '>>'} {json.dumps(payload, separators=(',', ':'))}")
+    def trace(_ski: str, direction: str, payload: dict[str, Any]) -> None:
+        if raw:
+            print(f"{'<<' if direction == 'in' else '>>'} {json.dumps(payload, separators=(',', ':'))}")
+        if files:
+            files.trace(direction, payload)
+
+    if raw or files:
+        service.trace = trace
 
     print(f"Our SKI: {identity.ski}")
     print("In the wallbox, pair with the EEBUS device 'pyeebus' / this SKI "
           "(Elli: Connections > HEMS connection > found EEBUS devices > Pair).\n")
 
     def on_state(remote: str, state: State, err: Exception | None) -> None:
+        if files and state != State.HELLO_WAITING_FOR_TRUST:
+            files.ship_state(f"[{remote[:8]}] {state.value}" + (f": {err!r}" if err else ""))
         if state == State.HELLO_WAITING_FOR_TRUST:
             return
         if isinstance(err, RemoteAbortError):
@@ -339,6 +425,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     sp = sub.add_parser("discover", help="list EEBUS devices on the network")
     sp.add_argument("--seconds", type=float, default=5)
+    sp.add_argument("--interface", help="network interface for mDNS (e.g. ovs_eth0), default all")
     sp = sub.add_parser("connect", help="pair with a device and act as energy manager (CEM)")
     sp.add_argument("ski", help="SKI of the device (from 'discover' or its web UI)")
     sp.add_argument("--host", help="connect directly instead of waiting for mDNS")
@@ -354,6 +441,11 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--lpc-release", action="store_true", help="deactivate the LPC limit")
     sp.add_argument("--write-failsafe", type=float, metavar="W",
                     help="test: write this failsafe power limit (LPC)")
+    sp.add_argument("--read-only", action="store_true",
+                    help="probe: announce no use cases, never bind or write; read and subscribe everything")
+    sp.add_argument("--interface", help="network interface for mDNS (e.g. ovs_eth0), default all")
+    sp.add_argument("--trace-file", type=Path, help="append every SPINE message (JSON lines) to this file")
+    sp.add_argument("--report", type=Path, help="keep a text report (device, use cases, data) in this file")
     sp = sub.add_parser("simulate-evse", help="run a simulated wallbox (for development)")
     sp.add_argument("--port", type=int, default=4713)
     sp.add_argument("--trust", help="SKI of the energy manager to accept")
@@ -363,15 +455,18 @@ def main(argv: list[str] | None = None) -> int:
                         format="%(asctime)s %(name)s %(message)s")
     try:
         if args.cmd == "discover":
-            return asyncio.run(discover(args.seconds))
+            return asyncio.run(discover(args.seconds, args.interface))
         if args.cmd == "simulate-evse":
             return asyncio.run(simulate(args.config, args.port, args.trust))
         if not is_ski_valid(args.ski):
             parser.error("SKI must be 40 hex characters")
+        if args.read_only and (args.lpc_limit is not None or args.lpc_release or args.write_failsafe is not None):
+            parser.error("--read-only does not write: drop --lpc-limit, --lpc-release and --write-failsafe")
         return asyncio.run(connect(normalize_ski(args.ski), args.host, args.port,
                                    args.local_port, args.config, args.raw, args.read_all,
                                    args.lpc_limit, args.lpc_duration, args.write_failsafe,
-                                   args.lpc_release))
+                                   args.lpc_release, args.read_only, args.interface,
+                                   args.trace_file, args.report))
     except KeyboardInterrupt:
         return 130
 
