@@ -76,11 +76,14 @@ def _print_service(s: ShipService) -> None:
 
 
 async def discover(seconds: float, interface: str | None = None) -> int:
-    mdns = ShipMdns(_zeroconf(interface))
+    zeroconf = _zeroconf(interface)
+    mdns = ShipMdns(zeroconf)
     await mdns.browse()
     print(f"Looking for EEBUS devices for {seconds:g} s ...")
     await asyncio.sleep(seconds)
     await mdns.close()
+    if zeroconf is not None:
+        await zeroconf.async_close()
     if not mdns.services:
         print("No EEBUS (SHIP) devices found. Same network? mDNS allowed?")
         return 1
@@ -386,6 +389,8 @@ async def connect(ski: str, host: str | None, port: int, local_port: int, config
             await asyncio.Event().wait()
     finally:
         await service.stop()
+        if zeroconf is not None:  # ours (--interface), the node does not close it
+            await zeroconf.async_close()
 
 
 # --- simulator -------------------------------------------------------------------------------
