@@ -11,7 +11,8 @@ from .cs import (
     LPCState,
     LPCStateMachine,
 )
-from .grid import LPC, LPP, MPC, DataInvalid, LoadLimit
+from .gcp import GcpMGCP, GridEnergyConfig, GridPowerConfig
+from .grid import LPC, LPP, MGCP, MPC, DataInvalid, LoadLimit
 from .mu import (
     MeasuredValue,
     MonitorCurrentConfig,
@@ -30,6 +31,7 @@ __all__ = [
     "EVSOC",
     "LPC",
     "LPP",
+    "MGCP",
     "MPC",
     "OPEV",
     "OSCEV",
@@ -39,6 +41,9 @@ __all__ = [
     "CsPowerLimitation",
     "DataInvalid",
     "DataNotAvailable",
+    "GcpMGCP",
+    "GridEnergyConfig",
+    "GridPowerConfig",
     "LPCState",
     "LPCStateMachine",
     "LimitationState",

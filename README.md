@@ -19,6 +19,7 @@ EEBUS is how energy managers talk to wallboxes, heat pumps and grid control boxe
 | Limitation and monitoring of power consumption: LPC and LPP (Energy Guard), MPC (Monitoring Appliance) | ✅ tested against eebus-go |
 | Controllable System side: CS-LPC and CS-LPP (feed-in) with the LPC/LPP state machine (init, limited, failsafe, ...) | ✅ tested against eebus-go |
 | Monitored Unit side: MU-MPC (power, energy, currents, voltages, frequency) | ✅ tested against eebus-go |
+| Grid connection point: GCP-MGCP (power, feed-in/consumed energy, currents, voltages, frequency, PV limitation factor) and MA-MGCP | ✅ tested against eebus-go |
 | Coordinated EV charging (CEVC) | later |
 
 ## Try it

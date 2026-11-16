@@ -1,6 +1,6 @@
 // Interop harness: an eebus-go CEM (EVSECC, EVCC, EVCEM, OPEV, OSCEV), a spine-go
 // based EVSE with an EV entity, an eebus-go controllable system (LPC, MPC) or an
-// eebus-go Energy Guard (LPC, LPP, MPC monitoring), to test pyeebus (and tools built on it)
+// eebus-go Energy Guard (LPC, LPP, MPC and MGCP monitoring), to test pyeebus (and tools built on it)
 // against the Go reference. It only accepts connections from the trusted SKI.
 //
 // Output lines (stdout) are meant for the tests: SKI, READY, CONNECTED, EVENT, ...
@@ -32,6 +32,7 @@ import (
 	cslpc "github.com/enbility/eebus-go/usecases/cs/lpc"
 	eglpc "github.com/enbility/eebus-go/usecases/eg/lpc"
 	eglpp "github.com/enbility/eebus-go/usecases/eg/lpp"
+	mamgcp "github.com/enbility/eebus-go/usecases/ma/mgcp"
 	mampc "github.com/enbility/eebus-go/usecases/ma/mpc"
 	mumpc "github.com/enbility/eebus-go/usecases/mu/mpc"
 	shipapi "github.com/enbility/ship-go/api"
@@ -68,6 +69,7 @@ type harness struct {
 	eglpp       *eglpp.LPP
 	egPLimit    float64
 	mampc       *mampc.MPC
+	mamgcp      *mamgcp.MGCP
 	egEVSE      spineapi.EntityRemoteInterface // the controllable system's entity
 	egLimit     float64
 	egHeartbeat bool // a heartbeat of the controllable system arrived (reported once)
@@ -250,6 +252,34 @@ func (h *harness) egEvent(_ string, _ spineapi.DeviceRemoteInterface, entity spi
 		if v, err := h.eglpp.FailsafeProductionActivePowerLimit(entity); err == nil {
 			say("EGP_FAILSAFE %s", floats([]float64{v}))
 		}
+	case mamgcp.DataUpdatePower:
+		if v, err := h.mamgcp.Power(entity); err == nil {
+			say("GCP_POWER %s", floats([]float64{v}))
+		}
+	case mamgcp.DataUpdatePowerLimitationFactor:
+		if v, err := h.mamgcp.PowerLimitationFactor(entity); err == nil {
+			say("GCP_FACTOR %s", floats([]float64{v}))
+		}
+	case mamgcp.DataUpdateEnergyFeedIn:
+		if v, err := h.mamgcp.EnergyFeedIn(entity); err == nil {
+			say("GCP_FEEDIN %s", floats([]float64{v}))
+		}
+	case mamgcp.DataUpdateEnergyConsumed:
+		if v, err := h.mamgcp.EnergyConsumed(entity); err == nil {
+			say("GCP_CONSUMED %s", floats([]float64{v}))
+		}
+	case mamgcp.DataUpdateCurrentPerPhase:
+		if v, err := h.mamgcp.CurrentPerPhase(entity); err == nil {
+			say("GCP_CURRENT %s", floats(v))
+		}
+	case mamgcp.DataUpdateVoltagePerPhase:
+		if v, err := h.mamgcp.VoltagePerPhase(entity); err == nil {
+			say("GCP_VOLTAGE %s", floats(v))
+		}
+	case mamgcp.DataUpdateFrequency:
+		if v, err := h.mamgcp.Frequency(entity); err == nil {
+			say("GCP_FREQUENCY %s", floats([]float64{v}))
+		}
 	case mampc.DataUpdatePower:
 		if v, err := h.mampc.Power(entity); err == nil {
 			say("MPC_POWER %s", floats([]float64{v}))
@@ -286,7 +316,8 @@ func (h *harness) setupEG() {
 	h.eglpc = eglpc.NewLPC(local, h.egEvent)
 	h.mampc = mampc.NewMPC(local, h.egEvent)
 	h.eglpp = eglpp.NewLPP(local, h.egEvent)
-	for _, uc := range []api.UseCaseInterface{h.eglpc, h.eglpp, h.mampc} {
+	h.mamgcp = mamgcp.NewMGCP(local, h.egEvent)
+	for _, uc := range []api.UseCaseInterface{h.eglpc, h.eglpp, h.mampc, h.mamgcp} {
 		if err := h.svc.AddUseCase(uc); err != nil {
 			panic(err)
 		}

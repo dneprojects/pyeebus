@@ -430,3 +430,71 @@ class MPC(UseCase):
 
     def frequency(self, entity: RemoteEntity) -> float:
         return self._single(entity, measurementType="frequency", scopeType="acFrequency")
+
+
+# --- MGCP ----------------------------------------------------------------------------------
+
+
+class MGCP(MPC):
+    """Monitoring of the grid connection point, Monitoring Appliance side (eebus-go ma/mgcp).
+
+    ``power``: positive is consumption from the grid, negative feed-in.
+    """
+
+    name = "monitoringOfGridConnectionPoint"
+    valid_actors = ("GridConnectionPoint",)
+    valid_entity_types = ("CEM", "GridConnectionPointOfPremises")
+    scenarios = (Scenario(1, False, (DEVICE_CONFIGURATION,)),
+                 Scenario(2, True, (ELECTRICAL_CONNECTION, MEASUREMENT)),
+                 *(Scenario(i, i == 3, (ELECTRICAL_CONNECTION, MEASUREMENT)) for i in (3, 4, 5, 6, 7)))
+    client_features = (DEVICE_CONFIGURATION, ELECTRICAL_CONNECTION, MEASUREMENT)
+
+    DATA_UPDATE_POWER_LIMITATION_FACTOR = "DataUpdatePowerLimitationFactor"
+    DATA_UPDATE_ENERGY_FEED_IN = "DataUpdateEnergyFeedIn"
+    DATA_UPDATE_CURRENT_PER_PHASE = "DataUpdateCurrentPerPhase"
+
+    _SCOPE_EVENTS = (("acPowerTotal", MPC.DATA_UPDATE_POWER), ("gridFeedIn", DATA_UPDATE_ENERGY_FEED_IN),
+                     ("gridConsumption", MPC.DATA_UPDATE_ENERGY_CONSUMED),
+                     ("acCurrent", DATA_UPDATE_CURRENT_PER_PHASE), ("acVoltage", MPC.DATA_UPDATE_VOLTAGE_PER_PHASE),
+                     ("acFrequency", MPC.DATA_UPDATE_FREQUENCY))
+
+    def handle_entity_event(self, event: Event) -> None:
+        if self.is_entity_added(event) and (f := ClientFeature.find(DEVICE_CONFIGURATION, self.local,
+                                                                     event.entity)):
+            f.subscribe()
+            f.request(FN_CONFIG_DESCRIPTIONS)
+        elif self.is_data_update(event, FN_CONFIG_DESCRIPTIONS):
+            if f := ClientFeature.find(DEVICE_CONFIGURATION, self.local, event.entity):
+                f.request(FN_CONFIG_VALUES)
+        elif self.is_data_update(event, FN_CONFIG_VALUES):
+            self._emit(event.ski, event.entity, self.DATA_UPDATE_POWER_LIMITATION_FACTOR)
+        super().handle_entity_event(event)
+
+    def power_limitation_factor(self, entity: RemoteEntity) -> float:
+        """PV feed-in power limitation factor in percent."""
+        f = ClientFeature.find(DEVICE_CONFIGURATION, self.local, entity)
+        if f is None:
+            raise DataNotAvailable("no device configuration feature")
+        descs = filter_items(f.items(FN_CONFIG_DESCRIPTIONS, "deviceConfigurationKeyValueDescriptionData"),
+                             keyName="pvCurtailmentLimitFactor")
+        if not descs:
+            raise DataNotAvailable("no power limitation factor")
+        item = next((i for i in f.items(FN_CONFIG_VALUES, "deviceConfigurationKeyValueData")
+                     if i.get("keyId") == descs[0].get("keyId")), None)
+        value = scaled_value(((item or {}).get("value") or {}).get("scaledNumber"))
+        if value is None:
+            raise DataNotAvailable("no power limitation factor value")
+        return value
+
+    def power(self, entity: RemoteEntity) -> float:
+        values = self._values(entity, {"measurementType": "power", "commodityType": "electricity",
+                                       "scopeType": "acPowerTotal"}, "consume", None)
+        if len(values) != 1:
+            raise DataNotAvailable("no total power")
+        return values[0]
+
+    def energy_feed_in(self, entity: RemoteEntity) -> float:
+        return self._single(entity, measurementType="energy", scopeType="gridFeedIn")
+
+    def energy_consumed(self, entity: RemoteEntity) -> float:
+        return self._single(entity, measurementType="energy", scopeType="gridConsumption")

@@ -107,7 +107,135 @@ class MeasuredValue:
 Value = float | MeasuredValue
 
 
-class MuMPC(UseCase):
+@dataclass
+class MeasurementSpec:
+    """One measurement a monitoring use case offers (description, parameter, constraint)."""
+
+    key: str  # "powerTotal", "power:a", "energyConsumed", "current:a", "voltage:ab", ...
+    measurement_type: str
+    unit: str
+    scope: str
+    source: str
+    parameter: dict[str, Any]
+    constraint: dict[str, Any] | None = None
+
+
+REAL_RMS = {"acMeasurementType": "real", "acMeasurementVariant": "rms"}
+
+
+def voltage_parameter(phase: str) -> dict[str, Any]:
+    """Phase to neutral (``a``) or phase to phase (``ab``: a in reference to b)."""
+    if len(phase) == 1:
+        reference = {"acMeasuredPhases": phase, "acMeasuredInReferenceTo": "neutral"}
+    else:
+        reference = {"acMeasuredPhases": phase[0], "acMeasuredInReferenceTo": phase[1]}
+    return {**reference, "acMeasurementType": "apparent", "acMeasurementVariant": "rms"}
+
+
+class MeasurementServer(UseCase):
+    """Server side of a monitoring use case (MU-MPC, GCP-MGCP): Measurement and
+    ElectricalConnection server features filled from :meth:`measurement_specs`."""
+
+    def __init__(self, local_entity: LocalEntity, on_event: UseCaseEventCallback | None = None) -> None:
+        super().__init__(local_entity, on_event)
+        self.ids: dict[str, int] = {}
+        """Measurement ids by key ("powerTotal", "power:a", "voltage:ab", ...)."""
+        self._sources: dict[str, str] = {}
+
+    def measurement_specs(self) -> list[MeasurementSpec]:
+        raise NotImplementedError
+
+    def add_features(self) -> None:
+        super().add_features()
+        ec = self.local.add_feature(ELECTRICAL_CONNECTION, Role.SERVER)
+        ec.add_function(FN_EC_DESCRIPTIONS, read=True)
+        ec.add_function(FN_EC_PARAMETERS, read=True)
+        meas = self.local.add_feature(MEASUREMENT, Role.SERVER)
+        for fn in (FN_MEAS_DESCRIPTIONS, FN_MEAS_CONSTRAINTS, FN_MEASUREMENTS):
+            meas.add_function(fn, read=True)
+
+        connection_id = self._connection_id(ec)
+        descs = _items(meas, FN_MEAS_DESCRIPTIONS, "measurementDescriptionData")
+        params = _items(ec, FN_EC_PARAMETERS, "electricalConnectionParameterDescriptionData")
+        constraints = _items(meas, FN_MEAS_CONSTRAINTS, "measurementConstraintsData")
+        for spec in self.measurement_specs():
+            measurement_id = next_id(descs, "measurementId")
+            descs.append({"measurementId": measurement_id, "measurementType": spec.measurement_type,
+                          "commodityType": "electricity", "unit": spec.unit, "scopeType": spec.scope})
+            params.append({"electricalConnectionId": connection_id,
+                           "parameterId": next_id(params, "parameterId"),
+                           "measurementId": measurement_id, "voltageType": "ac", **spec.parameter})
+            if spec.constraint:
+                constraints.append({**spec.constraint, "measurementId": measurement_id})
+            self.ids[spec.key] = measurement_id
+            self._sources[spec.key] = spec.source
+        meas.set_data(FN_MEAS_DESCRIPTIONS, {"measurementDescriptionData": descs})
+        ec.set_data(FN_EC_PARAMETERS, {"electricalConnectionParameterDescriptionData": params})
+        if constraints:
+            meas.set_data(FN_MEAS_CONSTRAINTS, {"measurementConstraintsData": constraints})
+
+    @staticmethod
+    def _connection_id(ec: LocalFeature) -> int:
+        """The id of the AC consumption connection, added if missing (eebus-go GetOrAddIdForDescription)."""
+        descs = _items(ec, FN_EC_DESCRIPTIONS, "electricalConnectionDescriptionData")
+        wanted = {"powerSupplyType": "ac", "positiveEnergyDirection": "consume"}
+        for desc in descs:
+            rest = {k: v for k, v in desc.items() if k != "electricalConnectionId"}
+            if desc.get("electricalConnectionId") is not None and rest == wanted:
+                return desc["electricalConnectionId"]
+        connection_id = max((d["electricalConnectionId"] for d in descs
+                             if isinstance(d.get("electricalConnectionId"), int)), default=0) + 1
+        descs.append({"electricalConnectionId": connection_id, **wanted})
+        ec.set_data(FN_EC_DESCRIPTIONS, {"electricalConnectionDescriptionData": descs})
+        return connection_id
+
+    def publish(self, values: dict[str, Value]) -> None:
+        """Publish values by key in one notify; raises ValueError (and changes nothing)
+        for keys the configuration does not provide."""
+        unsupported = [key for key in values if key not in self.ids]
+        if unsupported:
+            raise ValueError(f"not supported by the configuration: {', '.join(unsupported)}")
+        meas = self._server(MEASUREMENT)
+        items = {i.get("measurementId"): i for i in _items(meas, FN_MEASUREMENTS, "measurementData")}
+        for key, value in values.items():
+            items[self.ids[key]] = self._measurement(self.ids[key], value, self._sources[key])
+        meas.set_data(FN_MEASUREMENTS, {"measurementData": [items[k] for k in sorted(items)]})
+
+    @staticmethod
+    def _measurement(measurement_id: int, value: Value, source: str) -> dict[str, Any]:
+        if not isinstance(value, MeasuredValue):
+            value = MeasuredValue(float(value))
+        item: dict[str, Any] = {"measurementId": measurement_id, "valueType": "value",
+                                "value": scaled_number(value.value), "valueSource": source}
+        if value.timestamp is not None:
+            item["timestamp"] = format_datetime(value.timestamp)
+        if value.value_state is not None:
+            item["valueState"] = value.value_state
+        if value.evaluation_start is not None and value.evaluation_end is not None:
+            item["evaluationPeriod"] = {"startTime": format_datetime(value.evaluation_start),
+                                        "endTime": format_datetime(value.evaluation_end)}
+        return item
+
+    def _server(self, feature_type: str) -> LocalFeature:
+        feature = self.local.feature(feature_type, Role.SERVER)
+        if feature is None:
+            raise DataNotAvailable(f"local {feature_type} server not found")
+        return feature
+
+    def _value(self, key: str) -> float:
+        if key not in self.ids:
+            raise DataNotAvailable(f"{key} is not configured")
+        items = filter_items(_items(self._server(MEASUREMENT), FN_MEASUREMENTS, "measurementData"),
+                             measurementId=self.ids[key])
+        if not items or scaled_value(items[0].get("value")) is None:
+            raise DataNotAvailable(f"no {key} value")
+        return scaled_value(items[0]["value"])
+
+    def _per_phase(self, prefix: str) -> dict[str, float]:
+        return {key.split(":", 1)[1]: self._value(key) for key in self.ids if key.startswith(prefix + ":")}
+
+
+class MuMPC(MeasurementServer):
     """Monitoring of power consumption, Monitored Unit actor.
 
     Positive values are consumption (``positiveEnergyDirection`` consume).
@@ -135,9 +263,6 @@ class MuMPC(UseCase):
             if config is not None:
                 scenarios.append(Scenario(number, False, features))
         self.scenarios = tuple(scenarios)
-        # measurement ids, by key: "powerTotal", "power:a", "energyConsumed", "current:a", "voltage:ab", ...
-        self.ids: dict[str, int] = {}
-        self._sources: dict[str, str] = {}
 
     def _check_config(self) -> None:
         power = self.power_config
@@ -149,85 +274,42 @@ class MuMPC(UseCase):
             if phase not in VOLTAGE_PHASES or not power.supports(*phase):
                 raise ValueError(f"voltage phase {phase} is not in the connected phases {power.connected_phases!r}")
 
-    # --- setup ---------------------------------------------------------------------------------
-
-    def add_features(self) -> None:
-        super().add_features()
-        ec = self.local.add_feature(ELECTRICAL_CONNECTION, Role.SERVER)
-        ec.add_function(FN_EC_DESCRIPTIONS, read=True)
-        ec.add_function(FN_EC_PARAMETERS, read=True)
-        meas = self.local.add_feature(MEASUREMENT, Role.SERVER)
-        for fn in (FN_MEAS_DESCRIPTIONS, FN_MEAS_CONSTRAINTS, FN_MEASUREMENTS):
-            meas.add_function(fn, read=True)
-
-        connection_id = self._connection_id(ec)
-        descs = _items(meas, FN_MEAS_DESCRIPTIONS, "measurementDescriptionData")
-        params = _items(ec, FN_EC_PARAMETERS, "electricalConnectionParameterDescriptionData")
-        constraints = _items(meas, FN_MEAS_CONSTRAINTS, "measurementConstraintsData")
-
-        def add(key: str, measurement_type: str, unit: str, scope: str, source: str,
-                parameter: dict[str, Any], constraint: dict[str, Any] | None) -> None:
-            measurement_id = next_id(descs, "measurementId")
-            descs.append({"measurementId": measurement_id, "measurementType": measurement_type,
-                          "commodityType": "electricity", "unit": unit, "scopeType": scope})
-            params.append({"electricalConnectionId": connection_id,
-                           "parameterId": next_id(params, "parameterId"),
-                           "measurementId": measurement_id, "voltageType": "ac", **parameter})
-            if constraint:
-                constraints.append({**constraint, "measurementId": measurement_id})
-            self.ids[key] = measurement_id
-            self._sources[key] = source
-
-        real_rms = {"acMeasurementType": "real", "acMeasurementVariant": "rms"}
+    def measurement_specs(self) -> list[MeasurementSpec]:
         power = self.power_config
-        add("powerTotal", "power", "W", "acPowerTotal", power.value_source_total,
-            {"acMeasuredPhases": power.connected_phases, "acMeasuredInReferenceTo": "neutral", **real_rms},
-            power.constraints_total)
+        specs = [MeasurementSpec("powerTotal", "power", "W", "acPowerTotal", power.value_source_total,
+                                 {"acMeasuredPhases": power.connected_phases,
+                                  "acMeasuredInReferenceTo": "neutral", **REAL_RMS},
+                                 power.constraints_total)]
         for phase in _ordered(power.value_source_per_phase):
-            add(f"power:{phase}", "power", "W", "acPower", power.value_source_per_phase[phase],
-                {"acMeasuredPhases": phase, "acMeasuredInReferenceTo": "neutral", **real_rms},
-                power.constraints_per_phase.get(phase))
+            specs.append(MeasurementSpec(f"power:{phase}", "power", "W", "acPower",
+                                         power.value_source_per_phase[phase],
+                                         {"acMeasuredPhases": phase, "acMeasuredInReferenceTo": "neutral",
+                                          **REAL_RMS},
+                                         power.constraints_per_phase.get(phase)))
         if (energy := self.energy_config) is not None:
             if energy.value_source_consumption:
-                add("energyConsumed", "energy", "Wh", "acEnergyConsumed", energy.value_source_consumption,
-                    {"acMeasurementType": "real"}, energy.constraints_consumption)
+                specs.append(MeasurementSpec("energyConsumed", "energy", "Wh", "acEnergyConsumed",
+                                             energy.value_source_consumption, {"acMeasurementType": "real"},
+                                             energy.constraints_consumption))
             if energy.value_source_production:
-                add("energyProduced", "energy", "Wh", "acEnergyProduced", energy.value_source_production,
-                    {"acMeasurementType": "real"}, energy.constraints_production)
+                specs.append(MeasurementSpec("energyProduced", "energy", "Wh", "acEnergyProduced",
+                                             energy.value_source_production, {"acMeasurementType": "real"},
+                                             energy.constraints_production))
         if (current := self.current_config) is not None:
             for phase in _ordered(current.value_source_per_phase):
-                add(f"current:{phase}", "current", "A", "acCurrent", current.value_source_per_phase[phase],
-                    {"acMeasuredPhases": phase, **real_rms}, current.constraints_per_phase.get(phase))
+                specs.append(MeasurementSpec(f"current:{phase}", "current", "A", "acCurrent",
+                                             current.value_source_per_phase[phase],
+                                             {"acMeasuredPhases": phase, **REAL_RMS},
+                                             current.constraints_per_phase.get(phase)))
         if (voltage := self.voltage_config) is not None:
             for phase in _ordered(voltage.value_source_per_phase):
-                reference = {"acMeasuredPhases": phase, "acMeasuredInReferenceTo": "neutral"} if len(phase) == 1 \
-                    else {"acMeasuredPhases": phase[0], "acMeasuredInReferenceTo": phase[1]}
-                add(f"voltage:{phase}", "voltage", "V", "acVoltage", voltage.value_source_per_phase[phase],
-                    {**reference, "acMeasurementType": "apparent", "acMeasurementVariant": "rms"},
-                    voltage.constraints_per_phase.get(phase))
+                specs.append(MeasurementSpec(f"voltage:{phase}", "voltage", "V", "acVoltage",
+                                             voltage.value_source_per_phase[phase], voltage_parameter(phase),
+                                             voltage.constraints_per_phase.get(phase)))
         if (frequency := self.frequency_config) is not None:
-            add("frequency", "frequency", "Hz", "acFrequency", frequency.value_source, {},
-                frequency.constraints)
-
-        meas.set_data(FN_MEAS_DESCRIPTIONS, {"measurementDescriptionData": descs})
-        ec.set_data(FN_EC_PARAMETERS, {"electricalConnectionParameterDescriptionData": params})
-        if constraints:
-            meas.set_data(FN_MEAS_CONSTRAINTS, {"measurementConstraintsData": constraints})
-
-    @staticmethod
-    def _connection_id(ec: LocalFeature) -> int:
-        """The id of the AC consumption connection, added if missing (eebus-go GetOrAddIdForDescription)."""
-        descs = _items(ec, FN_EC_DESCRIPTIONS, "electricalConnectionDescriptionData")
-        wanted = {"powerSupplyType": "ac", "positiveEnergyDirection": "consume"}
-        for desc in descs:
-            if desc.get("electricalConnectionId") is not None and \
-                    {k: v for k, v in desc.items() if k != "electricalConnectionId"} == wanted:
-                return desc["electricalConnectionId"]
-        connection_id = max((d["electricalConnectionId"] for d in descs
-                             if isinstance(d.get("electricalConnectionId"), int)), default=0) + 1
-        descs.append({"electricalConnectionId": connection_id, **wanted})
-        ec.set_data(FN_EC_DESCRIPTIONS, {"electricalConnectionDescriptionData": descs})
-        return connection_id
+            specs.append(MeasurementSpec("frequency", "frequency", "Hz", "acFrequency",
+                                         frequency.value_source, {}, frequency.constraints))
+        return specs
 
     # --- update --------------------------------------------------------------------------------
 
@@ -247,49 +329,7 @@ class MuMPC(UseCase):
                                   ("voltage", voltage_per_phase)):
             for phase, value in (per_phase or {}).items():
                 values[f"{prefix}:{phase}"] = value
-        unsupported = [key for key in values if key not in self.ids]
-        if unsupported:
-            raise ValueError(f"not supported by the configuration: {', '.join(unsupported)}")
-        meas = self._server(MEASUREMENT)
-        items = {i.get("measurementId"): i for i in _items(meas, FN_MEASUREMENTS, "measurementData")}
-        for key, value in values.items():
-            items[self.ids[key]] = self._measurement(self.ids[key], value, self._sources[key])
-        meas.set_data(FN_MEASUREMENTS, {"measurementData": [items[k] for k in sorted(items)]})
-
-    @staticmethod
-    def _measurement(measurement_id: int, value: Value, source: str) -> dict[str, Any]:
-        if not isinstance(value, MeasuredValue):
-            value = MeasuredValue(float(value))
-        item: dict[str, Any] = {"measurementId": measurement_id, "valueType": "value",
-                                "value": scaled_number(value.value), "valueSource": source}
-        if value.timestamp is not None:
-            item["timestamp"] = format_datetime(value.timestamp)
-        if value.value_state is not None:
-            item["valueState"] = value.value_state
-        if value.evaluation_start is not None and value.evaluation_end is not None:
-            item["evaluationPeriod"] = {"startTime": format_datetime(value.evaluation_start),
-                                        "endTime": format_datetime(value.evaluation_end)}
-        return item
-
-    # --- local values --------------------------------------------------------------------------
-
-    def _server(self, feature_type: str) -> LocalFeature:
-        feature = self.local.feature(feature_type, Role.SERVER)
-        if feature is None:
-            raise DataNotAvailable(f"local {feature_type} server not found")
-        return feature
-
-    def _value(self, key: str) -> float:
-        if key not in self.ids:
-            raise DataNotAvailable(f"{key} is not configured")
-        items = filter_items(_items(self._server(MEASUREMENT), FN_MEASUREMENTS, "measurementData"),
-                             measurementId=self.ids[key])
-        if not items or scaled_value(items[0].get("value")) is None:
-            raise DataNotAvailable(f"no {key} value")
-        return scaled_value(items[0]["value"])
-
-    def _per_phase(self, prefix: str) -> dict[str, float]:
-        return {key.split(":", 1)[1]: self._value(key) for key in self.ids if key.startswith(prefix + ":")}
+        self.publish(values)
 
     def power(self) -> float:
         return self._value("powerTotal")

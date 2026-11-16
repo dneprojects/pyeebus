@@ -24,6 +24,7 @@ from pyeebus.usecases import (
     CsLPC,
     CsLPP,
     DataNotAvailable,
+    GcpMGCP,
     LoadLimit,
     LPCState,
     MonitorCurrentConfig,
@@ -405,4 +406,37 @@ async def test_eebus_go_energy_guard_limits_pyeebus_production():
     finally:
         lpp.close()
         await cs.stop()
+        await harness.stop()
+
+
+async def test_eebus_go_monitoring_appliance_reads_pyeebus_gcp():
+    """eebus-go ma/mgcp (like a heat pump) <- pyeebus GCP-MGCP (HEMS at the grid connection point)."""
+    hems = EebusService(Identity.create("gcp"), brand="pyeebus", model="TestGCP", serial="1", port=0, **NODE)
+    abc = {"a": "measuredValue", "b": "measuredValue", "c": "measuredValue"}
+    gcp = GcpMGCP(hems.entities[0], pv_curtailment=True, current=MonitorCurrentConfig(abc),
+                  voltage=MonitorVoltageConfig(abc), frequency=MonitorFrequencyConfig()).setup()
+    gcp.update(power_total=-2500, energy_feed_in=5000, energy_consumed=12000,
+               current_per_phase={"a": 4, "b": 3, "c": 4}, voltage_per_phase={"a": 230, "b": 231, "c": 232},
+               frequency=50, power_limitation_factor=70)
+    port = free_port()
+    harness = await start_harness("eg", hems.ski, port)
+    try:
+        go_ski = (await harness.expect("SKI")).split()[1]
+        hems.trust(go_ski)
+        await hems.start()
+        await hems.node.connect("127.0.0.1", port, go_ski)
+
+        assert await harness.expect("GCP_POWER") == "GCP_POWER -2500"
+        assert await harness.expect("GCP_FACTOR") == "GCP_FACTOR 70"
+        assert await harness.expect("GCP_FEEDIN") == "GCP_FEEDIN 5000"
+        assert await harness.expect("GCP_CONSUMED") == "GCP_CONSUMED 12000"
+        assert await harness.expect("GCP_CURRENT") == "GCP_CURRENT 4,3,4"
+        assert await harness.expect("GCP_VOLTAGE") == "GCP_VOLTAGE 230,231,232"
+        assert await harness.expect("GCP_FREQUENCY") == "GCP_FREQUENCY 50"
+
+        gcp.update(power_total=1500, power_limitation_factor=60)
+        await harness.expect("GCP_POWER 1500")
+        await harness.expect("GCP_FACTOR 60")
+    finally:
+        await hems.stop()
         await harness.stop()

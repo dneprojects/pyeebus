@@ -2,7 +2,7 @@
 
 Runs an [eebus-go](https://github.com/enbility/eebus-go) CEM (EVSECC, EVCC, EVCEM, OPEV,
 OSCEV), a spine-go based EVSE with a pluggable EV, an eebus-go controllable system (LPC, MPC)
-or an eebus-go Energy Guard (LPC, LPP, MPC monitoring), so the tests can check pyeebus' SPINE
+or an eebus-go Energy Guard (LPC, LPP, MPC and MGCP monitoring), so the tests can check pyeebus' SPINE
 layer and use cases against the Go reference in both directions.
 
 ```bash
