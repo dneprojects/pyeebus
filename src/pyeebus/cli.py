@@ -351,8 +351,9 @@ async def connect(ski: str, host: str | None, port: int, local_port: int, config
         service.trace = trace
 
     print(f"Our SKI: {identity.ski}")
-    print("In the wallbox, pair with the EEBUS device 'pyeebus' / this SKI "
-          "(Elli: Connections > HEMS connection > found EEBUS devices > Pair).\n")
+    print("In the device's app or web UI, trust the EEBUS device 'pyeebus' with this SKI "
+          "(Elli: Connections > HEMS connection > found EEBUS devices > Pair; "
+          "myVAILLANT: Options > Network settings > EEBUS).\n")
 
     def on_state(remote: str, state: State, err: Exception | None) -> None:
         if files and state != State.HELLO_WAITING_FOR_TRUST:
@@ -360,7 +361,7 @@ async def connect(ski: str, host: str | None, port: int, local_port: int, config
         if state == State.HELLO_WAITING_FOR_TRUST:
             return
         if isinstance(err, RemoteAbortError):
-            print(f"[{remote[:8]}] not paired yet: pair 'pyeebus' in the wallbox UI, retrying ...")
+            print(f"[{remote[:8]}] not paired yet: trust 'pyeebus' in the device's app, retrying ...")
             return
         if state in (State.COMPLETE, State.CLOSED, State.ERROR):
             print(f"[{remote[:8]}] SHIP {state.value}" + (f": {err}" if err else ""))
