@@ -18,6 +18,7 @@ EEBUS is how energy managers talk to wallboxes, heat pumps and grid control boxe
 | Use cases (CEM side): EVSECC, EVCC, EVCEM, OPEV, OSCEV, EVSOC | ✅ tested against eebus-go |
 | Limitation and monitoring of power consumption: LPC (Energy Guard), MPC (Monitoring Appliance) | ✅ tested against eebus-go |
 | Controllable System side: CS-LPC with the LPC state machine (init, limited, failsafe, ...) | ✅ tested against eebus-go |
+| Monitored Unit side: MU-MPC (power, energy, currents, voltages, frequency) | ✅ tested against eebus-go |
 | Coordinated EV charging (CEVC), production use cases (LPP etc.) | later |
 
 ## Try it
@@ -63,11 +64,14 @@ For devices that offer power limitation (LPC, e.g. wallboxes with §14a EnWG sup
 To act as the controllable system yourself (a device behind a §14a EnWG control box), use `CsLPC`. Incoming limits and failsafe values go through your approval callbacks; the built-in LPC state machine handles heartbeat timeout (failsafe), failsafe duration and limit durations, so you only apply `effective_limit()` (W, `None` = no limit) whenever `CsLPC.STATE_CHANGED` comes:
 
 ```python
+mpc = MuMPC(service.entities[0], power=MonitorPowerConfig("abc"),
+            energy=MonitorEnergyConfig(value_source_consumption="measuredValue")).setup()  # before CsLPC
 lpc = CsLPC(service.entities[0], on_event, approve_limit=lambda limit: None).setup()
 lpc.set_consumption_nominal_max(11000)
 lpc.set_consumption_limit(LoadLimit(11000, is_active=False))
 lpc.set_failsafe_consumption_limit(4200)
 lpc.set_failsafe_duration_minimum(2 * 3600)
+mpc.update(power_total=3200, energy_consumed=1_234_000)   # W, Wh; notifies the monitoring appliance
 ```
 
 The use cases follow eebus-go: `evcc.charge_state(ev)`, `evcc.communication_standard(ev)`, `evcem.energy_charged(ev)`, `opev.current_limits(ev)` (min/max/default per phase) and so on. Values the device has not sent yet raise `DataNotAvailable`.

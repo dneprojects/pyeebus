@@ -242,6 +242,30 @@ func (h *harness) egEvent(_ string, _ spineapi.DeviceRemoteInterface, entity spi
 		if v, err := h.mampc.Power(entity); err == nil {
 			say("MPC_POWER %s", floats([]float64{v}))
 		}
+	case mampc.DataUpdatePowerPerPhase:
+		if v, err := h.mampc.PowerPerPhase(entity); err == nil {
+			say("MPC_POWER_PHASES %s", floats(v))
+		}
+	case mampc.DataUpdateEnergyConsumed:
+		if v, err := h.mampc.EnergyConsumed(entity); err == nil {
+			say("MPC_ENERGY_CONSUMED %s", floats([]float64{v}))
+		}
+	case mampc.DataUpdateEnergyProduced:
+		if v, err := h.mampc.EnergyProduced(entity); err == nil {
+			say("MPC_ENERGY_PRODUCED %s", floats([]float64{v}))
+		}
+	case mampc.DataUpdateCurrentsPerPhase:
+		if v, err := h.mampc.CurrentPerPhase(entity); err == nil {
+			say("MPC_CURRENT %s", floats(v))
+		}
+	case mampc.DataUpdateVoltagePerPhase:
+		if v, err := h.mampc.VoltagePerPhase(entity); err == nil {
+			say("MPC_VOLTAGE %s", floats(v))
+		}
+	case mampc.DataUpdateFrequency:
+		if v, err := h.mampc.Frequency(entity); err == nil {
+			say("MPC_FREQUENCY %s", floats([]float64{v}))
+		}
 	}
 }
 
@@ -575,6 +599,15 @@ func main() {
 			h.egWrite(v, true, d)
 		case "release":
 			h.egWrite(h.egLimit, false, 0)
+		case "nominal":
+			// eebus-go only sends DataUpdatePowerConsumptionNominalMax for electrical connection 0
+			if h.egEVSE == nil {
+				say("NOMINAL_ERROR no controllable system")
+			} else if v, err := h.eglpc.ConsumptionNominalMax(h.egEVSE); err != nil {
+				say("NOMINAL_ERROR %s", err)
+			} else {
+				say("EG_NOMINAL_MAX %s", floats([]float64{v}))
+			}
 		case "failsafe":
 			v, _ := strconv.ParseFloat(parts[1], 64)
 			h.egWriteFailsafe(v, 0)
