@@ -190,6 +190,7 @@ async def connect(ski: str, host: str | None, port: int, local_port: int, config
                   lpc_duration: float = 300, write_failsafe: float | None = None,
                   lpc_release: bool = False, read_only: bool = False, interface: str | None = None,
                   trace_file: Path | None = None, report: Path | None = None) -> int:
+    read_all = read_all or read_only
     identity = Identity.load_or_create(config, "pyeebus")
     trust = TrustStore.load(config / "trust.json")
     zeroconf = _zeroconf(interface)
@@ -228,7 +229,6 @@ async def connect(ski: str, host: str | None, port: int, local_port: int, config
         ucs: dict[str, UseCase] = {}
         for feature_type in PROBE_FEATURES:
             cem.add_feature(feature_type, Role.CLIENT)
-        read_all = True
     else:
         ucs = {cls.__name__: cls(cem, on_uc_event).setup() for cls in (*ALL_EV_USE_CASES, LPC, MPC)}
     if read_all:
