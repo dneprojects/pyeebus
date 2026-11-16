@@ -13,5 +13,12 @@ EEBUS_GO_HARNESS=$PWD/harness pytest ../../tests/test_interop_eebus_go.py
 ```
 
 `-mode cem|evse|lpc|eg -port N -trust <SKI>`; in EVSE mode, stdin takes `plug`, `unplug`,
-`measure <A> <Wh>` and `quit`; in LPC mode `power <W>`; in Energy Guard mode `limit <W> [s]`
-and `release`.
+`measure <A> <Wh>` and `quit`; in LPC mode `power <W>`; in Energy Guard mode `limit <W> [s]`,
+`release`, `failsafe <W>`, `failsafeduration <s>` and `heartbeat stop|start`.
+
+Without a local Go toolchain, build with Docker (for Windows add `-e GOOS=windows` and
+`-o harness.exe`):
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src golang:1.24 sh -c "go mod tidy && go build -o harness ."
+```

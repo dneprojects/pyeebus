@@ -51,22 +51,23 @@ func say(format string, args ...any) {
 }
 
 type harness struct {
-	svc     *service.Service
-	evsecc  *evsecc.EVSECC
-	evcc    *evcc.EVCC
-	evcem   *evcem.EVCEM
-	opev    *opev.OPEV
-	oscev   *oscev.OSCEV
-	wrote   bool
-	evse    spineapi.EntityLocalInterface
-	ev      spineapi.EntityLocalInterface
-	verbose bool
-	cslpc   *cslpc.LPC
-	mumpc   *mumpc.MPC
-	eglpc   *eglpc.LPC
-	mampc   *mampc.MPC
-	egEVSE  spineapi.EntityRemoteInterface
-	egLimit float64
+	svc         *service.Service
+	evsecc      *evsecc.EVSECC
+	evcc        *evcc.EVCC
+	evcem       *evcem.EVCEM
+	opev        *opev.OPEV
+	oscev       *oscev.OSCEV
+	wrote       bool
+	evse        spineapi.EntityLocalInterface
+	ev          spineapi.EntityLocalInterface
+	verbose     bool
+	cslpc       *cslpc.LPC
+	mumpc       *mumpc.MPC
+	eglpc       *eglpc.LPC
+	mampc       *mampc.MPC
+	egEVSE      spineapi.EntityRemoteInterface // the controllable system's entity
+	egLimit     float64
+	egHeartbeat bool // a heartbeat of the controllable system arrived (reported once)
 }
 
 // --- service reader / logging -------------------------------------------------------
@@ -209,20 +210,34 @@ func (h *harness) setupCEM() {
 func (h *harness) egEvent(_ string, _ spineapi.DeviceRemoteInterface, entity spineapi.EntityRemoteInterface, event api.EventType) {
 	switch event {
 	case eglpc.UseCaseSupportUpdate:
-		if entity != nil && entity.EntityType() == model.EntityTypeTypeEVSE && h.egEVSE == nil {
+		if entity != nil && h.egEVSE == nil && h.eglpc.IsScenarioAvailableAtEntity(entity, 1) {
 			h.egEVSE = entity
-			say("EG_EVSE")
+			if entity.EntityType() == model.EntityTypeTypeEVSE {
+				say("EG_EVSE")
+			}
+			say("EG_ENTITY %s", entity.EntityType())
 		}
 	case eglpc.DataUpdateLimit:
 		if l, err := h.eglpc.ConsumptionLimit(entity); err == nil {
-			say("EG_LIMIT %s %t", floats([]float64{l.Value}), l.IsActive)
+			say("EG_LIMIT %s %t %t", floats([]float64{l.Value}), l.IsActive, l.IsChangeable)
 		}
 	case eglpc.DataUpdateFailsafeConsumptionActivePowerLimit:
 		if v, err := h.eglpc.FailsafeConsumptionActivePowerLimit(entity); err == nil {
 			say("EG_FAILSAFE %s", floats([]float64{v}))
 		}
+	case eglpc.DataUpdateFailsafeDurationMinimum:
+		if d, err := h.eglpc.FailsafeDurationMinimum(entity); err == nil {
+			say("EG_FAILSAFE_DURATION %s", d)
+		}
+	case eglpc.DataUpdatePowerConsumptionNominalMax:
+		if v, err := h.eglpc.ConsumptionNominalMax(entity); err == nil {
+			say("EG_NOMINAL_MAX %s", floats([]float64{v}))
+		}
 	case eglpc.DataUpdateHeartbeat:
-		say("EG_HEARTBEAT")
+		if !h.egHeartbeat {
+			h.egHeartbeat = true
+			say("EG_HEARTBEAT")
+		}
 	case mampc.DataUpdatePower:
 		if v, err := h.mampc.Power(entity); err == nil {
 			say("MPC_POWER %s", floats([]float64{v}))
@@ -252,6 +267,23 @@ func (h *harness) egWrite(value float64, active bool, duration time.Duration) {
 	_, err := h.eglpc.WriteConsumptionLimit(h.egEVSE, limit, func(r model.ResultDataType, _ model.MsgCounterType) {
 		say("WRITE_RESULT %d", *r.ErrorNumber)
 	})
+	if err != nil {
+		say("WRITE_ERROR %s", err)
+	}
+}
+
+// write the failsafe values (the result shows up as EG_FAILSAFE / EG_FAILSAFE_DURATION)
+func (h *harness) egWriteFailsafe(value float64, duration time.Duration) {
+	if h.egEVSE == nil {
+		say("WRITE_ERROR no controllable system")
+		return
+	}
+	var err error
+	if duration > 0 {
+		_, err = h.eglpc.WriteFailsafeDurationMinimum(h.egEVSE, duration)
+	} else {
+		_, err = h.eglpc.WriteFailsafeConsumptionActivePowerLimit(h.egEVSE, value)
+	}
 	if err != nil {
 		say("WRITE_ERROR %s", err)
 	}
@@ -543,6 +575,20 @@ func main() {
 			h.egWrite(v, true, d)
 		case "release":
 			h.egWrite(h.egLimit, false, 0)
+		case "failsafe":
+			v, _ := strconv.ParseFloat(parts[1], 64)
+			h.egWriteFailsafe(v, 0)
+		case "failsafeduration":
+			secs, _ := strconv.ParseFloat(parts[1], 64)
+			h.egWriteFailsafe(0, time.Duration(secs*float64(time.Second)))
+		case "heartbeat":
+			if len(parts) > 1 && parts[1] == "stop" {
+				h.eglpc.StopHeartbeat()
+				say("HEARTBEAT_STOPPED")
+			} else {
+				h.eglpc.StartHeartbeat()
+				say("HEARTBEAT_STARTED")
+			}
 		case "quit":
 			h.svc.Shutdown()
 			return

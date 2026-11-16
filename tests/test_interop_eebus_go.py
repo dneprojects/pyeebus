@@ -21,8 +21,10 @@ from pyeebus.usecases import (
     LPC,
     MPC,
     OPEV,
+    CsLPC,
     DataNotAvailable,
     LoadLimit,
+    LPCState,
     PhaseLimit,
 )
 
@@ -205,4 +207,89 @@ async def test_pyeebus_energy_guard_controls_eebus_go_lpc_device():
         assert await wait_for(lambda: mpc.power(evse) == 6000)
     finally:
         await cem.stop()
+        await harness.stop()
+
+
+async def test_eebus_go_energy_guard_controls_pyeebus_cs():
+    """eebus-go eg/lpc (Energy Guard, like a control box) -> pyeebus CS-LPC."""
+    cs = EebusService(Identity.create("cs"), brand="pyeebus", model="TestCS", serial="1", port=0, **NODE)
+    events: list[str] = []
+    approvals: list[LoadLimit] = []
+
+    def approve_limit(limit: LoadLimit) -> str | None:
+        approvals.append(limit)
+        return "below the minimum" if limit.is_active and limit.value < 1000 else None
+
+    # short heartbeat timeout, so the test does not wait 2 minutes for failsafe
+    lpc = CsLPC(cs.entities[0], lambda _ski, _entity, name: events.append(name),
+                approve_limit=approve_limit, heartbeat_timeout=8).setup()
+    lpc.set_consumption_nominal_max(11000)
+    lpc.set_consumption_limit(LoadLimit(11000, is_active=False))
+    lpc.set_failsafe_consumption_limit(4200)
+    lpc.set_failsafe_duration_minimum(2 * 3600)
+    port = free_port()
+    harness = await start_harness("eg", cs.ski, port)
+    try:
+        go_ski = (await harness.expect("SKI")).split()[1]
+        cs.trust(go_ski)
+        await cs.start()
+        await cs.node.connect("127.0.0.1", port, go_ski)
+
+        # the guard sees the start values and our heartbeat; we see the guard's heartbeat
+        assert await harness.expect("EG_ENTITY") == "EG_ENTITY CEM"
+        assert await harness.expect("EG_LIMIT") == "EG_LIMIT 11000 false true"
+        assert await harness.expect("EG_FAILSAFE ") == "EG_FAILSAFE 4200"
+        assert await harness.expect("EG_FAILSAFE_DURATION") == "EG_FAILSAFE_DURATION 2h0m0s"
+        assert await harness.expect("EG_NOMINAL_MAX") == "EG_NOMINAL_MAX 11000"
+        await harness.expect("EG_HEARTBEAT", timeout=15)
+        await wait_for(lpc.is_heartbeat_within_duration)
+        assert (lpc.state, lpc.effective_limit()) == (LPCState.INIT, 4200)
+
+        # limit with duration
+        await harness.send("limit 4200 3600")
+        assert await harness.expect("WRITE_RESULT") == "WRITE_RESULT 0"
+        assert approvals[-1] == LoadLimit(4200, True, duration=3600)
+        assert await wait_for(lambda: lpc.state == LPCState.LIMITED)
+        assert lpc.effective_limit() == 4200
+        await harness.expect("EG_LIMIT 4200 true")
+
+        # denied by the application
+        harness.lines.clear()
+        await harness.send("limit 500")
+        assert await harness.expect("WRITE_RESULT") == "WRITE_RESULT 7"
+        assert lpc.consumption_limit().value == 4200
+
+        harness.lines.clear()
+        await harness.send("release")
+        assert await harness.expect("WRITE_RESULT") == "WRITE_RESULT 0"
+        assert await wait_for(lambda: lpc.state == LPCState.UNLIMITED_CONTROLLED)
+        assert lpc.effective_limit() is None
+        await harness.expect("EG_LIMIT 500 false")
+
+        # failsafe values
+        await harness.send("failsafe 5000")
+        assert await harness.expect("EG_FAILSAFE 5000")
+        assert lpc.failsafe_consumption_limit() == (5000, True)
+        await harness.send("failsafeduration 10800")
+        assert await harness.expect("EG_FAILSAFE_DURATION 3h0m0s")
+        assert lpc.failsafe_duration_minimum() == (10800, True)
+        assert CsLPC.DATA_UPDATE_FAILSAFE_POWER in events
+        assert CsLPC.DATA_UPDATE_FAILSAFE_DURATION in events
+
+        # the guard's heartbeat stops: failsafe; back with heartbeat and a new limit
+        await harness.send("heartbeat stop")
+        assert await wait_for(lambda: lpc.state == LPCState.FAILSAFE, timeout=20)
+        assert lpc.effective_limit() == 5000
+        assert CsLPC.HEARTBEAT_TIMEOUT in events
+        await harness.send("heartbeat start")
+        await wait_for(lpc.is_heartbeat_within_duration, timeout=15)
+        assert lpc.state == LPCState.FAILSAFE
+        harness.lines.clear()
+        await harness.send("limit 3000")
+        assert await harness.expect("WRITE_RESULT") == "WRITE_RESULT 0"
+        assert await wait_for(lambda: lpc.state == LPCState.LIMITED)
+        assert lpc.effective_limit() == 3000
+    finally:
+        lpc.close()
+        await cs.stop()
         await harness.stop()
