@@ -1,11 +1,13 @@
-"""Controllable System use cases (port of eebus-go's cs/lpc).
+"""Controllable System use cases (port of eebus-go's cs/lpc and cs/lpp).
 
+* :class:`CsLPP` limitation of power production (feed-in), the same with the
+  production direction, failsafe production limit and production nominal max.
 * :class:`CsLPC` limitation of power consumption, Controllable System side:
   the device (e.g. a heat pump, wallbox or HEMS behind a §14a EnWG control box)
   offers an active power limit, the failsafe values and its nominal maximum to
   an Energy Guard, receives the guard's heartbeat and approves or denies the
   guard's writes.
-* :class:`LPCStateMachine` the LPC states of the Controllable System (init,
+* :class:`LimitationStateMachine` the LPC/LPP states of the Controllable System (init,
   unlimited/controlled, limited, failsafe, unlimited/autonomous). eebus-go leaves
   this to the application; pyeebus runs it inside :class:`CsLPC`, so the
   application only has to apply :meth:`CsLPC.effective_limit`.
@@ -66,9 +68,11 @@ from .grid import (
     FN_LIMIT_DESCRIPTIONS,
     FN_LIMITS,
     KEY_FAILSAFE_DURATION,
-    KEY_FAILSAFE_POWER,
     LoadLimit,
 )
+
+KEY_FAILSAFE_CONSUMPTION = "failsafeConsumptionActivePowerLimit"
+KEY_FAILSAFE_PRODUCTION = "failsafeProductionActivePowerLimit"
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -87,7 +91,7 @@ ConfigurationApproval = Callable[[dict[str, float]], str | None]
 # --- state machine ---------------------------------------------------------------------------
 
 
-class LPCState:
+class LimitationState:
     INIT = "init"
     UNLIMITED_CONTROLLED = "unlimitedControlled"
     LIMITED = "limited"
@@ -96,7 +100,7 @@ class LPCState:
 
 
 @dataclass
-class LPCStateMachine:
+class LimitationStateMachine:
     """The LPC states of a Controllable System, driven with monotonic timestamps.
 
     * init (after start): the failsafe limit applies. A heartbeat plus a limit
@@ -113,7 +117,7 @@ class LPCStateMachine:
 
     heartbeat_timeout: float = HEARTBEAT_TIMEOUT_SECONDS
     now: float = 0.0
-    state: str = LPCState.INIT
+    state: str = LimitationState.INIT
     since: float = field(init=False)
     last_heartbeat: float | None = None
     limit_active: bool = False
@@ -133,13 +137,13 @@ class LPCStateMachine:
             return False
         self.state, self.since = state, now
         self._limit_received = False
-        self.failsafe_until = now + failsafe_duration if state == LPCState.FAILSAFE else None
+        self.failsafe_until = now + failsafe_duration if state == LimitationState.FAILSAFE else None
         return True
 
     def _controlled(self, now: float) -> bool:
         if self.limit_active and self.limit_until is not None and now >= self.limit_until:
             self.limit_active, self.limit_until = False, None
-        return self._set(LPCState.LIMITED if self.limit_active else LPCState.UNLIMITED_CONTROLLED, now)
+        return self._set(LimitationState.LIMITED if self.limit_active else LimitationState.UNLIMITED_CONTROLLED, now)
 
     def heartbeat(self, now: float, failsafe_duration: float = 0.0) -> bool:
         """A heartbeat of the Energy Guard arrived; returns True if the state changed."""
@@ -155,46 +159,48 @@ class LPCStateMachine:
         self.limit_active, self.limit_value = active, value
         self.limit_until = now + duration if active and duration else None
         self._limit_received = True
-        if self.state in (LPCState.LIMITED, LPCState.UNLIMITED_CONTROLLED):
+        if self.state in (LimitationState.LIMITED, LimitationState.UNLIMITED_CONTROLLED):
             return self._controlled(now)
         return self.update(now, failsafe_duration)
 
     def update(self, now: float, failsafe_duration: float = 0.0) -> bool:
         """Apply the timeouts; returns True if the state changed."""
         hb_ok = self.heartbeat_ok(now)
-        if self.state in (LPCState.LIMITED, LPCState.UNLIMITED_CONTROLLED):
+        if self.state in (LimitationState.LIMITED, LimitationState.UNLIMITED_CONTROLLED):
             if not hb_ok:
-                return self._set(LPCState.FAILSAFE, now, failsafe_duration)
+                return self._set(LimitationState.FAILSAFE, now, failsafe_duration)
             return self._controlled(now)
         if self._limit_received and hb_ok:
             return self._controlled(now)
-        if self.state == LPCState.INIT and now - self.since >= self.heartbeat_timeout:
-            return self._set(LPCState.FAILSAFE, now, failsafe_duration)
-        if (self.state == LPCState.FAILSAFE and self.failsafe_until is not None
+        if self.state == LimitationState.INIT and now - self.since >= self.heartbeat_timeout:
+            return self._set(LimitationState.FAILSAFE, now, failsafe_duration)
+        if (self.state == LimitationState.FAILSAFE and self.failsafe_until is not None
                 and now >= self.failsafe_until):
-            return self._set(LPCState.UNLIMITED_AUTONOMOUS, now)
+            return self._set(LimitationState.UNLIMITED_AUTONOMOUS, now)
         return False
 
 
-# --- CS-LPC ------------------------------------------------------------------------------------
+# --- CS-LPC / CS-LPP ---------------------------------------------------------------------------
 
 
-class CsLPC(UseCase):
-    """Limitation of power consumption, Controllable System actor.
+class CsPowerLimitation(UseCase):
+    """Common Controllable System side of LPC and LPP (eebus-go cs/lpc and cs/lpp are identical
+    except for the direction, the failsafe key and the nominal max characteristic).
 
     Server features: LoadControl (active power limit), DeviceConfiguration
-    (failsafe limit and duration), DeviceDiagnosis (own heartbeat) and
-    ElectricalConnection (nominal maximum); client feature DeviceDiagnosis for
-    the Energy Guard's heartbeat.
+    (failsafe limit and duration, the duration is shared by LPC and LPP),
+    DeviceDiagnosis (own heartbeat) and ElectricalConnection (nominal maximum);
+    client feature DeviceDiagnosis for the Energy Guard's heartbeat.
 
     Incoming writes go through ``approve_limit`` / ``approve_configuration``
     (synchronously, via :attr:`LocalFeature.write_approval`); without them every
     valid write is accepted. Writes to a value that is not changeable and
     failsafe durations outside 2-24 h are always denied.
+
+    Each use case runs its own :class:`LimitationStateMachine` with the shared heartbeat.
     """
 
     actor = "ControllableSystem"
-    name = "limitationOfPowerConsumption"
     version = "1.0.0"
     scenarios = (Scenario(1, True), Scenario(2, True), Scenario(3, True, (DEVICE_DIAGNOSIS,)),
                  Scenario(4, True))
@@ -202,18 +208,24 @@ class CsLPC(UseCase):
     valid_entity_types = ("GridGuard", "CEM")
     client_features = (DEVICE_DIAGNOSIS,)
 
+    DIRECTION = ""
+    KEY_FAILSAFE_POWER = ""
+    CHARACTERISTIC_HEMS = ""
+    CHARACTERISTIC_DEVICE = ""
+
     # eebus-go events
     DATA_UPDATE_LIMIT = "DataUpdateLimit"
-    DATA_UPDATE_FAILSAFE_POWER = "DataUpdateFailsafeConsumptionActivePowerLimit"
+    DATA_UPDATE_FAILSAFE_POWER = ""
     DATA_UPDATE_FAILSAFE_DURATION = "DataUpdateFailsafeDurationMinimum"
     DATA_UPDATE_HEARTBEAT = "DataUpdateHeartbeat"
     # pyeebus events (state machine)
     STATE_CHANGED = "StateChanged"
     HEARTBEAT_TIMEOUT = "HeartbeatTimeout"
 
-    LIMIT_FILTER: dict[str, str] = {"limitType": "signDependentAbsValueLimit",  # noqa: RUF012
-                                    "limitCategory": "obligation", "limitDirection": "consume",
-                                    "scopeType": "activePowerLimit"}
+    @property
+    def limit_filter(self) -> dict[str, str]:
+        return {"limitType": "signDependentAbsValueLimit", "limitCategory": "obligation",
+                "limitDirection": self.DIRECTION, "scopeType": "activePowerLimit"}
 
     def __init__(self, local_entity, on_event: UseCaseEventCallback | None = None, *,
                  approve_limit: LimitApproval | None = None,
@@ -224,7 +236,7 @@ class CsLPC(UseCase):
         self.approve_limit = approve_limit
         self.approve_configuration = approve_configuration
         self.clock = clock
-        self.machine = LPCStateMachine(heartbeat_timeout, clock())
+        self.machine = LimitationStateMachine(heartbeat_timeout, clock())
         self._heartbeat_feature: RemoteFeature | None = None
         self._several_guards = False  # KEO workaround: several entities with DeviceDiagnosis
         self._guard: tuple[str, RemoteEntity | None] = ("", None)
@@ -244,9 +256,9 @@ class CsLPC(UseCase):
         lc.add_function(FN_LIMITS, read=True, write=True)
         add_write_approval(lc, self._approve_limit_write)
         descs = as_list((lc.data.get(FN_LIMIT_DESCRIPTIONS) or {}).get("loadControlLimitDescriptionData"))
-        if not filter_items(descs, self.LIMIT_FILTER):
+        if not filter_items(descs, self.limit_filter):
             limit_id = next_id(descs, "limitId")
-            descs.append({"limitId": limit_id, **self.LIMIT_FILTER,
+            descs.append({"limitId": limit_id, **self.limit_filter,
                           "measurementId": self._power_total_measurement_id(), "unit": "W"})
             lc.set_data(FN_LIMIT_DESCRIPTIONS, {"loadControlLimitDescriptionData": descs})
             self._update_limit_item({"limitId": limit_id, "isLimitChangeable": True,
@@ -258,12 +270,12 @@ class CsLPC(UseCase):
         add_write_approval(dc, self._approve_configuration_write)
         descs = as_list((dc.data.get(FN_CONFIG_DESCRIPTIONS) or {}).get(
             "deviceConfigurationKeyValueDescriptionData"))
-        for key, value_type, initial in ((KEY_FAILSAFE_POWER, "scaledNumber", scaled_number(0)),
+        for key, value_type, initial in ((self.KEY_FAILSAFE_POWER, "scaledNumber", scaled_number(0)),
                                          (KEY_FAILSAFE_DURATION, "duration", format_duration(0))):
             if filter_items(descs, keyName=key):
                 continue
             desc = {"keyId": next_id(descs, "keyId"), "keyName": key, "valueType": value_type}
-            if key == KEY_FAILSAFE_POWER:
+            if key == self.KEY_FAILSAFE_POWER:
                 desc["unit"] = "W"
             descs.append(desc)
             dc.set_data(FN_CONFIG_DESCRIPTIONS, {"deviceConfigurationKeyValueDescriptionData": descs})
@@ -285,7 +297,7 @@ class CsLPC(UseCase):
                           "unit": "W"})
             ec.set_data(FN_EC_CHARACTERISTICS, {"electricalConnectionCharacteristicData": chars})
 
-    def setup(self) -> CsLPC:
+    def setup(self) -> CsPowerLimitation:
         super().setup()
         with contextlib.suppress(RuntimeError):
             self._start_watchdog()
@@ -339,14 +351,14 @@ class CsLPC(UseCase):
         return 0
 
     def _characteristic_type(self) -> str:
-        # LPC 1.0 2.2: a HEMS provides the contractual nominal max, other devices their own
+        # LPC/LPP 1.0 2.2: a HEMS provides the contractual nominal max, other devices their own
         if self.local.device.device_type in (None, "EnergyManagementSystem"):
-            return "contractualConsumptionNominalMax"
-        return "powerConsumptionNominalMax"
+            return self.CHARACTERISTIC_HEMS
+        return self.CHARACTERISTIC_DEVICE
 
     def _limit_id(self) -> int:
         descs = filter_items(self._local_items(LOAD_CONTROL, FN_LIMIT_DESCRIPTIONS,
-                                               "loadControlLimitDescriptionData"), self.LIMIT_FILTER)
+                                               "loadControlLimitDescriptionData"), self.limit_filter)
         if len(descs) != 1 or descs[0].get("limitId") is None:
             raise DataNotAvailable("no active power limit description")
         return descs[0]["limitId"]
@@ -392,7 +404,7 @@ class CsLPC(UseCase):
 
     # --- scenario 1: limit -------------------------------------------------------------------
 
-    def consumption_limit(self) -> LoadLimit:
+    def limit(self) -> LoadLimit:
         """The current active power consumption limit (as last written or set)."""
         item = self._limit_item()
         if item is None or scaled_value(item.get("value")) is None:
@@ -407,7 +419,7 @@ class CsLPC(UseCase):
                     limit.is_active = False  # LPC implementation guideline 2.2
         return limit
 
-    def set_consumption_limit(self, limit: LoadLimit) -> None:
+    def set_limit(self, limit: LoadLimit) -> None:
         """Set the limit data, e.g. the start values or a locally changed limit.
 
         Does not drive the state machine: only limits from the Energy Guard do.
@@ -459,16 +471,16 @@ class CsLPC(UseCase):
 
     # --- scenario 2: failsafe values ----------------------------------------------------------
 
-    def failsafe_consumption_limit(self) -> tuple[float, bool]:
+    def failsafe_limit(self) -> tuple[float, bool]:
         """(failsafe active power limit in W, changeable by the Energy Guard)."""
-        item = self._config_item(KEY_FAILSAFE_POWER) or {}
+        item = self._config_item(self.KEY_FAILSAFE_POWER) or {}
         value = scaled_value((item.get("value") or {}).get("scaledNumber"))
         if value is None:
             raise DataNotAvailable("no failsafe limit")
         return value, bool(item.get("isValueChangeable"))
 
-    def set_failsafe_consumption_limit(self, watts: float, changeable: bool = True) -> None:
-        self._update_config_item(KEY_FAILSAFE_POWER, {"scaledNumber": scaled_number(watts)}, changeable)
+    def set_failsafe_limit(self, watts: float, changeable: bool = True) -> None:
+        self._update_config_item(self.KEY_FAILSAFE_POWER, {"scaledNumber": scaled_number(watts)}, changeable)
 
     def failsafe_duration_minimum(self) -> tuple[float, bool]:
         """(failsafe duration minimum in s, changeable by the Energy Guard)."""
@@ -486,7 +498,7 @@ class CsLPC(UseCase):
     def _approve_configuration_write(self, msg: Message) -> SpineError | None:
         values: dict[str, float] = {}
         for item in as_list((msg.data or {}).get("deviceConfigurationKeyValueData")):
-            for key in (KEY_FAILSAFE_POWER, KEY_FAILSAFE_DURATION):
+            for key in (self.KEY_FAILSAFE_POWER, KEY_FAILSAFE_DURATION):
                 try:
                     desc = self._config_key(key)
                 except DataNotAvailable:
@@ -497,7 +509,7 @@ class CsLPC(UseCase):
                 if current.get("isValueChangeable") is False:
                     return SpineError(ErrorNumber.COMMAND_REJECTED, f"{key} is not changeable")
                 value = item.get("value") or {}
-                if key == KEY_FAILSAFE_POWER:
+                if key == self.KEY_FAILSAFE_POWER:
                     watts = scaled_value(value.get("scaledNumber"))
                     if watts is None or watts < 0:
                         return SpineError(ErrorNumber.COMMAND_REJECTED, "invalid failsafe limit")
@@ -549,13 +561,13 @@ class CsLPC(UseCase):
             raise DataNotAvailable("no nominal max characteristic")
         return chars[0]
 
-    def consumption_nominal_max(self) -> float:
+    def nominal_max(self) -> float:
         value = scaled_value(self._characteristic().get("value"))
         if value is None:
             raise DataNotAvailable("no nominal max")
         return value
 
-    def set_consumption_nominal_max(self, watts: float) -> None:
+    def set_nominal_max(self, watts: float) -> None:
         char = self._characteristic()
         ec = self._server(ELECTRICAL_CONNECTION)
         items = [dict(i) for i in as_list((ec.data.get(FN_EC_CHARACTERISTICS) or {}).get(
@@ -569,7 +581,7 @@ class CsLPC(UseCase):
 
     @property
     def state(self) -> str:
-        """The current :class:`LPCState`."""
+        """The current :class:`LimitationState`."""
         return self.machine.state
 
     def effective_limit(self) -> float | None:
@@ -577,12 +589,12 @@ class CsLPC(UseCase):
 
         init and failsafe: the failsafe limit; limited: the written limit.
         """
-        if self.machine.state in (LPCState.INIT, LPCState.FAILSAFE):
+        if self.machine.state in (LimitationState.INIT, LimitationState.FAILSAFE):
             try:
-                return self.failsafe_consumption_limit()[0]
+                return self.failsafe_limit()[0]
             except DataNotAvailable:
                 return 0.0
-        if self.machine.state == LPCState.LIMITED:
+        if self.machine.state == LimitationState.LIMITED:
             return self.machine.limit_value
         return None
 
@@ -606,8 +618,8 @@ class CsLPC(UseCase):
             self._state_changed(before)
 
     def _state_changed(self, before: str) -> None:
-        _LOGGER.info("LPC state %s -> %s (limit %s)", before, self.machine.state, self.effective_limit())
-        if before == LPCState.LIMITED and self.machine.state == LPCState.UNLIMITED_CONTROLLED:
+        _LOGGER.info("%s state %s -> %s (limit %s)", self.name, before, self.machine.state, self.effective_limit())
+        if before == LimitationState.LIMITED and self.machine.state == LimitationState.UNLIMITED_CONTROLLED:
             # the duration ran out: show the guard that the limit is no longer active
             with contextlib.suppress(DataNotAvailable):
                 item = self._limit_item()
@@ -626,7 +638,7 @@ class CsLPC(UseCase):
             try:
                 self.tick()
             except Exception:
-                _LOGGER.exception("LPC watchdog failed")
+                _LOGGER.exception("%s watchdog failed", self.name)
 
     # --- events ---------------------------------------------------------------------------------
 
@@ -702,7 +714,7 @@ class CsLPC(UseCase):
             if item is not None and "timePeriod" in item:
                 self._update_limit_item({"limitId": item["limitId"]}, ("timePeriod",))
         self._emit(event.ski, event.entity, self.DATA_UPDATE_LIMIT)
-        limit = self.consumption_limit()
+        limit = self.limit()
         before = self.machine.state
         if self.machine.limit(self.clock(), limit.is_active, limit.value, limit.duration,
                               self._failsafe_duration()):
@@ -710,7 +722,49 @@ class CsLPC(UseCase):
 
     def _configuration_written(self, event: Event) -> None:
         written, self._written_keys = self._written_keys, set()
-        if KEY_FAILSAFE_POWER in written:
+        if self.KEY_FAILSAFE_POWER in written:
             self._emit(event.ski, event.entity, self.DATA_UPDATE_FAILSAFE_POWER)
         if KEY_FAILSAFE_DURATION in written:
             self._emit(event.ski, event.entity, self.DATA_UPDATE_FAILSAFE_DURATION)
+
+
+class CsLPC(CsPowerLimitation):
+    """Limitation of power consumption (LPC), Controllable System actor (eebus-go cs/lpc)."""
+
+    name = "limitationOfPowerConsumption"
+    DIRECTION = "consume"
+    KEY_FAILSAFE_POWER = KEY_FAILSAFE_CONSUMPTION
+    CHARACTERISTIC_HEMS = "contractualConsumptionNominalMax"
+    CHARACTERISTIC_DEVICE = "powerConsumptionNominalMax"
+    DATA_UPDATE_FAILSAFE_POWER = "DataUpdateFailsafeConsumptionActivePowerLimit"
+
+    consumption_limit = CsPowerLimitation.limit
+    set_consumption_limit = CsPowerLimitation.set_limit
+    failsafe_consumption_limit = CsPowerLimitation.failsafe_limit
+    set_failsafe_consumption_limit = CsPowerLimitation.set_failsafe_limit
+    consumption_nominal_max = CsPowerLimitation.nominal_max
+    set_consumption_nominal_max = CsPowerLimitation.set_nominal_max
+
+
+class CsLPP(CsPowerLimitation):
+    """Limitation of power production (LPP, e.g. feed-in limit), Controllable System actor
+    (eebus-go cs/lpp). Limits are positive values in W of produced power."""
+
+    name = "limitationOfPowerProduction"
+    DIRECTION = "produce"
+    KEY_FAILSAFE_POWER = KEY_FAILSAFE_PRODUCTION
+    CHARACTERISTIC_HEMS = "contractualProductionNominalMax"
+    CHARACTERISTIC_DEVICE = "powerProductionNominalMax"
+    DATA_UPDATE_FAILSAFE_POWER = "DataUpdateFailsafeProductionActivePowerLimit"
+
+    production_limit = CsPowerLimitation.limit
+    set_production_limit = CsPowerLimitation.set_limit
+    failsafe_production_limit = CsPowerLimitation.failsafe_limit
+    set_failsafe_production_limit = CsPowerLimitation.set_failsafe_limit
+    production_nominal_max = CsPowerLimitation.nominal_max
+    set_production_nominal_max = CsPowerLimitation.set_nominal_max
+
+
+# names of the first version (CS-LPC only)
+LPCState = LimitationState
+LPCStateMachine = LimitationStateMachine
