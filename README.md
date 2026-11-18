@@ -17,6 +17,7 @@ EEBUS is how energy managers talk to wallboxes, heat pumps and grid control boxe
 | SPINE: devices/entities/features, detailed discovery, use case data, subscriptions, bindings, partial updates, heartbeat | ✅ tested against spine-go |
 | Use cases (CEM side): EVSECC, EVCC, EVCEM, OPEV, OSCEV, EVSOC | ✅ tested against eebus-go |
 | Limitation and monitoring of power consumption: LPC (Energy Guard), MPC (Monitoring Appliance) | ✅ tested against eebus-go |
+| Controllable System side: CS-LPC with the LPC state machine (init, limited, failsafe, ...) | ✅ tested against eebus-go |
 | Coordinated EV charging (CEVC), production use cases (LPP etc.) | later |
 
 ## Try it
@@ -58,6 +59,15 @@ await opev.write_load_control_limits(ev, [PhaseLimit(p, 10) for p in "abc"])   #
 ```
 
 For devices that offer power limitation (LPC, e.g. wallboxes with §14a EnWG support) use `LPC` and `MPC`: `await lpc.write_consumption_limit(evse, LoadLimit(4200, duration=3600))`, `mpc.power(evse)`, `mpc.energy_consumed(evse)`.
+
+To act as the controllable system yourself (a device behind a §14a EnWG control box), use `CsLPC`. Incoming limits and failsafe values go through your approval callbacks; the built-in LPC state machine (LPC 1.0.0) handles init, heartbeat timeout (failsafe), failsafe duration and limit durations, so you only apply `effective_limit()` (W, `None` = no limit) whenever `CsLPC.STATE_CHANGED` comes. The failsafe limit is required: it applies from the start (init) until the Energy Guard states a limit:
+
+```python
+lpc = CsLPC(service.entities[0], on_event, failsafe_limit=4200, failsafe_duration=2 * 3600,
+            approve_limit=lambda limit: None).setup()
+lpc.set_consumption_nominal_max(11000)
+lpc.set_consumption_limit(LoadLimit(11000, is_active=False))
+```
 
 The use cases follow eebus-go: `evcc.charge_state(ev)`, `evcc.communication_standard(ev)`, `evcem.energy_charged(ev)`, `opev.current_limits(ev)` (min/max/default per phase) and so on. Values the device has not sent yet raise `DataNotAvailable`.
 

@@ -370,3 +370,25 @@ class UseCase:
 
 def items_match(items: list[dict[str, Any]], selector: dict[str, Any]) -> bool:
     return any(matches(i, selector) for i in items)
+
+
+# --- server feature helpers (features/server) --------------------------------------------
+
+
+def next_id(items: list[dict[str, Any]], key: str) -> int:
+    """The next free id of a list (as eebus-go: highest id + 1, starting at 0)."""
+    ids = [i[key] for i in items if isinstance(i.get(key), int)]
+    return max(ids) + 1 if ids else 0
+
+
+def add_write_approval(feature: LocalFeature, approval: Callable[[Any], SpineError | None]) -> None:
+    """Add a write approval to a local server feature; all approvals must accept (as spine-go)."""
+    previous = feature.write_approval
+    if previous is None:
+        feature.write_approval = approval
+        return
+
+    def both(msg: Any) -> SpineError | None:
+        return previous(msg) or approval(msg)
+
+    feature.write_approval = both
