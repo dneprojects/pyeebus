@@ -222,11 +222,9 @@ async def test_eebus_go_energy_guard_controls_pyeebus_cs():
 
     # short heartbeat timeout, so the test does not wait 2 minutes for failsafe
     lpc = CsLPC(cs.entities[0], lambda _ski, _entity, name: events.append(name),
-                approve_limit=approve_limit, heartbeat_timeout=8).setup()
+                failsafe_limit=4200, approve_limit=approve_limit, heartbeat_timeout=8).setup()
     lpc.set_consumption_nominal_max(11000)
     lpc.set_consumption_limit(LoadLimit(11000, is_active=False))
-    lpc.set_failsafe_consumption_limit(4200)
-    lpc.set_failsafe_duration_minimum(2 * 3600)
     port = free_port()
     harness = await start_harness("eg", cs.ski, port)
     try:

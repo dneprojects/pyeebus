@@ -60,14 +60,13 @@ await opev.write_load_control_limits(ev, [PhaseLimit(p, 10) for p in "abc"])   #
 
 For devices that offer power limitation (LPC, e.g. wallboxes with §14a EnWG support) use `LPC` and `MPC`: `await lpc.write_consumption_limit(evse, LoadLimit(4200, duration=3600))`, `mpc.power(evse)`, `mpc.energy_consumed(evse)`.
 
-To act as the controllable system yourself (a device behind a §14a EnWG control box), use `CsLPC`. Incoming limits and failsafe values go through your approval callbacks; the built-in LPC state machine handles heartbeat timeout (failsafe), failsafe duration and limit durations, so you only apply `effective_limit()` (W, `None` = no limit) whenever `CsLPC.STATE_CHANGED` comes:
+To act as the controllable system yourself (a device behind a §14a EnWG control box), use `CsLPC`. Incoming limits and failsafe values go through your approval callbacks; the built-in LPC state machine (LPC 1.0.0) handles init, heartbeat timeout (failsafe), failsafe duration and limit durations, so you only apply `effective_limit()` (W, `None` = no limit) whenever `CsLPC.STATE_CHANGED` comes. The failsafe limit is required: it applies from the start (init) until the Energy Guard states a limit:
 
 ```python
-lpc = CsLPC(service.entities[0], on_event, approve_limit=lambda limit: None).setup()
+lpc = CsLPC(service.entities[0], on_event, failsafe_limit=4200, failsafe_duration=2 * 3600,
+            approve_limit=lambda limit: None).setup()
 lpc.set_consumption_nominal_max(11000)
 lpc.set_consumption_limit(LoadLimit(11000, is_active=False))
-lpc.set_failsafe_consumption_limit(4200)
-lpc.set_failsafe_duration_minimum(2 * 3600)
 ```
 
 The use cases follow eebus-go: `evcc.charge_state(ev)`, `evcc.communication_standard(ev)`, `evcem.energy_charged(ev)`, `opev.current_limits(ev)` (min/max/default per phase) and so on. Values the device has not sent yet raise `DataNotAvailable`.

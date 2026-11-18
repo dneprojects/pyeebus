@@ -17,26 +17,55 @@ FAILSAFE = 2 * 3600
 # --- state machine ----------------------------------------------------------------------------
 
 
-def test_init_goes_to_failsafe_without_heartbeat():
+def test_init_stays_without_heartbeat():
+    # LPC-906: no transition from init to failsafe; init keeps the failsafe limit
     m = LPCStateMachine(now=0)
-    assert not m.update(119, FAILSAFE)
-    assert m.state == LPCState.INIT
-    assert m.update(120, FAILSAFE)
-    assert (m.state, m.failsafe_until) == (LPCState.FAILSAFE, 120 + FAILSAFE)
-    assert m.update(120 + FAILSAFE, FAILSAFE)
+    assert not m.update(120, FAILSAFE)
+    assert not m.update(120 + FAILSAFE, FAILSAFE)
+    assert (m.state, m.failsafe_until) == (LPCState.INIT, None)
+
+
+def test_init_may_go_autonomous():
+    m = LPCStateMachine(now=0, autonomous_after_init=True)
+    assert not m.update(119)
+    assert m.update(120)
     assert m.state == LPCState.UNLIMITED_AUTONOMOUS
 
 
-def test_init_needs_heartbeat_and_limit():
+def test_init_needs_heartbeat_then_limit():
     m = LPCStateMachine(now=0)
     assert not m.heartbeat(5, FAILSAFE)
     assert m.state == LPCState.INIT
     assert m.limit(6, True, 4200, None, FAILSAFE)
     assert m.state == LPCState.LIMITED
     m = LPCStateMachine(now=0)
-    assert not m.limit(5, False, 4200, None, FAILSAFE)  # no heartbeat yet
-    assert m.heartbeat(6, FAILSAFE)
+    m.heartbeat(5)
+    assert m.limit(6, False, 4200, None)
     assert m.state == LPCState.UNLIMITED_CONTROLLED
+
+
+def test_write_is_evaluated_only_after_a_heartbeat():
+    m = LPCStateMachine(now=0)
+    assert not m.limit(5, True, 4200, None)  # no heartbeat yet
+    assert not m.heartbeat(6)  # a heartbeat after the write does not count
+    assert m.state == LPCState.INIT
+    assert not m.limit(67, True, 4200, None)  # more than 60 s after the heartbeat
+    assert m.state == LPCState.INIT
+    m.heartbeat(100)
+    assert m.limit(160, True, 4200, None)  # within 60 s
+    assert m.state == LPCState.LIMITED
+
+
+def test_denied_write_leaves_init_unlimited():
+    # LPC-902: heartbeat and write leave init, also if the limit is denied
+    m = LPCStateMachine(now=0)
+    m.heartbeat(5)
+    assert m.limit(6, True, 500, None, accepted=False)
+    assert (m.state, m.limit_active) == (LPCState.UNLIMITED_CONTROLLED, False)
+    # in unlimited/controlled and limited a denied write changes nothing
+    m.limit(7, True, 4200, None)
+    assert not m.limit(8, True, 500, None, accepted=False)
+    assert (m.state, m.limit_value) == (LPCState.LIMITED, 4200)
 
 
 def test_limit_duration_and_release():
@@ -67,18 +96,54 @@ def test_failsafe_needs_heartbeat_and_new_limit():
     assert m.state == LPCState.FAILSAFE
     assert m.limit(201, False, 0, None, FAILSAFE)
     assert m.state == LPCState.UNLIMITED_CONTROLLED
-    # a limit without heartbeat is kept until the heartbeat is back
+    # a limit without heartbeat is not evaluated
     m.update(400, FAILSAFE)
     assert m.state == LPCState.FAILSAFE
     assert not m.limit(401, True, 3000, None, FAILSAFE)
-    assert m.heartbeat(402, FAILSAFE)
-    assert (m.state, m.limit_value) == (LPCState.LIMITED, 3000)
+    assert not m.heartbeat(402, FAILSAFE)
+    assert m.state == LPCState.FAILSAFE
+    # a denied write after the heartbeat leaves failsafe as well [LPC-916]
+    assert m.limit(403, True, 500, None, FAILSAFE, accepted=False)
+    assert (m.state, m.limit_active) == (LPCState.UNLIMITED_CONTROLLED, False)
+
+
+def test_failsafe_ends_if_no_limit_follows_the_heartbeat():
+    # LPC-921: heartbeat back, but no limit within 120 s: unlimited/autonomous
+    m = LPCStateMachine(now=0)
+    m.heartbeat(1)
+    m.limit(1, True, 4200, None)
+    m.update(122, FAILSAFE)
+    assert m.state == LPCState.FAILSAFE
+    m.heartbeat(300)
+    m.heartbeat(360)
+    assert not m.update(419, FAILSAFE)
+    assert m.heartbeat(420, FAILSAFE)
+    assert m.state == LPCState.UNLIMITED_AUTONOMOUS
+    # the heartbeat lost again in between restarts the 120 s
+    m = LPCStateMachine(now=0)
+    m.heartbeat(1)
+    m.limit(1, True, 4200, None)
+    m.update(122, FAILSAFE)
+    m.heartbeat(300)
+    m.update(421, FAILSAFE)  # heartbeat timed out
+    m.heartbeat(500)
+    assert not m.update(560, FAILSAFE)
+    assert m.state == LPCState.FAILSAFE
+
+
+def test_failsafe_ends_after_the_failsafe_duration():
+    m = LPCStateMachine(now=0)
+    m.heartbeat(1)
+    m.limit(1, True, 4200, None)
+    m.update(122, FAILSAFE)
+    assert m.failsafe_until == 122 + FAILSAFE
+    assert m.update(122 + FAILSAFE, FAILSAFE)
+    assert m.state == LPCState.UNLIMITED_AUTONOMOUS
 
 
 def test_autonomous_needs_heartbeat_and_new_limit():
-    m = LPCStateMachine(now=0)
-    m.update(120, 7200)
-    m.update(7320, 7200)
+    m = LPCStateMachine(now=0, autonomous_after_init=True)
+    m.update(120)
     assert m.state == LPCState.UNLIMITED_AUTONOMOUS
     assert not m.heartbeat(7400)
     assert m.limit(7401, True, 5000, None)
@@ -129,12 +194,11 @@ async def guard_and_cs():
 
     lpc = LPC(eg.entities[0]).setup()
     cs_lpc = CsLPC(cs.entities[0], lambda _ski, _entity, name: events.append(name),
+                   failsafe_limit=4200, failsafe_duration=FAILSAFE,
                    approve_limit=approve_limit, approve_configuration=approve_configuration,
                    clock=clock).setup()
     cs_lpc.set_consumption_nominal_max(11000)
     cs_lpc.set_consumption_limit(LoadLimit(11000, is_active=False))
-    cs_lpc.set_failsafe_consumption_limit(4200)
-    cs_lpc.set_failsafe_duration_minimum(FAILSAFE)
 
     cs.node.trust.trust(eg.ski, eg.identity.cert_pem)
     eg.node.trust.trust(cs.ski)
@@ -152,11 +216,15 @@ async def guard_and_cs():
 async def test_local_values_and_features():
     cs = EebusService(Identity.create("cs"), brand="pyeebus", model="TestCS", serial="2", port=0,
                       device_type="HeatPumpAppliance", entity_types=("HeatPumpAppliance",))
-    uc = CsLPC(cs.entities[0]).setup()
+    with pytest.raises(TypeError):
+        CsLPC(cs.entities[0])  # the failsafe limit is required
+    with pytest.raises(ValueError):
+        CsLPC(cs.entities[0], failsafe_limit=4200, failsafe_duration=3600)
+    uc = CsLPC(cs.entities[0], failsafe_limit=4200).setup()
     try:
         assert uc.consumption_limit() == LoadLimit(0, is_active=False, is_changeable=True)
-        assert uc.failsafe_consumption_limit() == (0, True)
-        assert uc.failsafe_duration_minimum() == (0, True)  # PT0S until set, as eebus-go
+        assert uc.failsafe_consumption_limit() == (4200, True)
+        assert uc.failsafe_duration_minimum() == (FAILSAFE, True)  # default 2 h
         with pytest.raises(ValueError):
             uc.set_failsafe_duration_minimum(3600)
         uc.set_failsafe_duration_minimum(3 * 3600, changeable=False)
@@ -171,7 +239,7 @@ async def test_local_values_and_features():
         uc.set_consumption_limit(LoadLimit(6000, is_active=False))
         assert uc.consumption_limit().duration is None
         assert uc.state == LPCState.INIT
-        assert uc.effective_limit() == 0  # init: the failsafe limit
+        assert uc.effective_limit() == 4200  # init: the failsafe limit
         use_cases = cs.device.node_management.data["nodeManagementUseCaseData"]["useCaseInformation"]
         assert use_cases[0]["actor"] == "ControllableSystem"
         assert use_cases[0]["useCaseSupport"][0]["scenarioSupport"] == [1, 2, 3, 4]

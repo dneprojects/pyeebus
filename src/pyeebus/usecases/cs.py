@@ -76,6 +76,10 @@ FAILSAFE_DURATION_MIN = 2 * 3600
 FAILSAFE_DURATION_MAX = 24 * 3600
 HEARTBEAT_TIMEOUT_SECONDS = 120.0
 """The Controllable System goes to failsafe if no heartbeat came for this long (LPC: 120 s)."""
+WRITE_AFTER_HEARTBEAT_SECONDS = 60.0
+"""A limit write leaves init, failsafe or unlimited/autonomous only this soon after a heartbeat."""
+FAILSAFE_RELEASE_SECONDS = 120.0
+"""Failsafe ends (unlimited/autonomous) if the heartbeat is back but no limit follows (LPC-921)."""
 
 LimitApproval = Callable[[LoadLimit], str | None]
 """Return None to accept an incoming limit, or the reason for denying it."""
@@ -97,30 +101,39 @@ class LPCState:
 
 @dataclass
 class LPCStateMachine:
-    """The LPC states of a Controllable System, driven with monotonic timestamps.
+    """The LPC states of a Controllable System (LPC 1.0.0), driven with monotonic timestamps.
 
-    * init (after start): the failsafe limit applies. A heartbeat plus a limit
-      write lead to limited or unlimited/controlled; no heartbeat plus limit
-      within ``heartbeat_timeout`` leads to failsafe.
-    * unlimited/controlled and limited follow the limit writes; an active limit
-      with a duration ends after it (back to unlimited/controlled).
-    * heartbeat missing for longer than ``heartbeat_timeout``: failsafe, the
-      failsafe limit applies for the failsafe duration minimum.
-    * failsafe and unlimited/autonomous are left only by a heartbeat together
-      with a limit written after entering the state; failsafe ends after the
-      failsafe duration minimum (unlimited/autonomous).
+    * init (after start): the failsafe limit applies. Without heartbeat and limit
+      the CS stays in init, or with ``autonomous_after_init`` goes to
+      unlimited/autonomous after ``heartbeat_timeout`` [LPC-906]. There is no
+      transition from init to failsafe.
+    * init, failsafe and unlimited/autonomous are left by a heartbeat followed
+      within ``write_window`` (60 s) by a limit write: limited if the limit was
+      accepted and is active, otherwise unlimited/controlled, also if the write
+      was denied [LPC-902], [LPC-916], [LPC-920]. A write without such a
+      heartbeat is not evaluated.
+    * unlimited/controlled and limited follow the accepted limit writes; an
+      active limit with a duration ends after it (back to unlimited/controlled).
+    * heartbeat missing for longer than ``heartbeat_timeout`` in
+      unlimited/controlled or limited: failsafe, the failsafe limit applies.
+    * failsafe ends (unlimited/autonomous) after the failsafe duration minimum,
+      or when the heartbeat is back but no limit followed within
+      ``release_timeout`` [LPC-921].
     """
 
     heartbeat_timeout: float = HEARTBEAT_TIMEOUT_SECONDS
     now: float = 0.0
+    autonomous_after_init: bool = False
+    write_window: float = WRITE_AFTER_HEARTBEAT_SECONDS
+    release_timeout: float = FAILSAFE_RELEASE_SECONDS
     state: str = LPCState.INIT
     since: float = field(init=False)
     last_heartbeat: float | None = None
+    heartbeat_returned: float | None = None  # first heartbeat after entering failsafe
     limit_active: bool = False
     limit_value: float | None = None
     limit_until: float | None = None
     failsafe_until: float | None = None
-    _limit_received: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.since = self.now
@@ -132,7 +145,7 @@ class LPCStateMachine:
         if state == self.state:
             return False
         self.state, self.since = state, now
-        self._limit_received = False
+        self.heartbeat_returned = None
         self.failsafe_until = now + failsafe_duration if state == LPCState.FAILSAFE else None
         return True
 
@@ -141,38 +154,54 @@ class LPCStateMachine:
             self.limit_active, self.limit_until = False, None
         return self._set(LPCState.LIMITED if self.limit_active else LPCState.UNLIMITED_CONTROLLED, now)
 
+    def _write_follows_heartbeat(self, now: float) -> bool:
+        return self.last_heartbeat is not None and 0 <= now - self.last_heartbeat <= self.write_window
+
     def heartbeat(self, now: float, failsafe_duration: float = 0.0) -> bool:
         """A heartbeat of the Energy Guard arrived; returns True if the state changed."""
         self.last_heartbeat = now
+        if self.state == LPCState.FAILSAFE and self.heartbeat_returned is None:
+            self.heartbeat_returned = now
         return self.update(now, failsafe_duration)
 
     def limit(self, now: float, active: bool, value: float | None, duration: float | None,
-              failsafe_duration: float = 0.0) -> bool:
-        """An (approved) limit write arrived; returns True if the state changed."""
-        if duration is not None and duration <= 0:
-            active = False  # LPC implementation guideline 2.2: duration 0 deactivates the limit
-            duration = None
-        self.limit_active, self.limit_value = active, value
-        self.limit_until = now + duration if active and duration else None
-        self._limit_received = True
+              failsafe_duration: float = 0.0, accepted: bool = True) -> bool:
+        """A limit write of the Energy Guard arrived, ``accepted`` or denied by the application;
+        returns True if the state changed."""
+        if accepted:
+            if duration is not None and duration <= 0:
+                active = False  # LPC implementation guideline 2.2: duration 0 deactivates the limit
+                duration = None
+            self.limit_active, self.limit_value = active, value
+            self.limit_until = now + duration if active and duration else None
         if self.state in (LPCState.LIMITED, LPCState.UNLIMITED_CONTROLLED):
-            return self._controlled(now)
-        return self.update(now, failsafe_duration)
+            return self._controlled(now) if accepted else False
+        if not self._write_follows_heartbeat(now):
+            return self.update(now, failsafe_duration)
+        if not accepted:
+            # a denied write leaves the state as well, but no limit applies [LPC-902/916/920]
+            self.limit_active, self.limit_until = False, None
+        return self._controlled(now)
 
     def update(self, now: float, failsafe_duration: float = 0.0) -> bool:
         """Apply the timeouts; returns True if the state changed."""
         hb_ok = self.heartbeat_ok(now)
+        if not hb_ok:
+            self.heartbeat_returned = None
         if self.state in (LPCState.LIMITED, LPCState.UNLIMITED_CONTROLLED):
             if not hb_ok:
                 return self._set(LPCState.FAILSAFE, now, failsafe_duration)
             return self._controlled(now)
-        if self._limit_received and hb_ok:
-            return self._controlled(now)
-        if self.state == LPCState.INIT and now - self.since >= self.heartbeat_timeout:
-            return self._set(LPCState.FAILSAFE, now, failsafe_duration)
-        if (self.state == LPCState.FAILSAFE and self.failsafe_until is not None
-                and now >= self.failsafe_until):
-            return self._set(LPCState.UNLIMITED_AUTONOMOUS, now)
+        if self.state == LPCState.INIT:
+            if self.autonomous_after_init and now - self.since >= self.heartbeat_timeout:
+                return self._set(LPCState.UNLIMITED_AUTONOMOUS, now)
+            return False
+        if self.state == LPCState.FAILSAFE:
+            if self.failsafe_until is not None and now >= self.failsafe_until:
+                return self._set(LPCState.UNLIMITED_AUTONOMOUS, now)
+            if (hb_ok and self.heartbeat_returned is not None
+                    and now - self.heartbeat_returned >= self.release_timeout):
+                return self._set(LPCState.UNLIMITED_AUTONOMOUS, now)  # [LPC-921]
         return False
 
 
@@ -216,15 +245,27 @@ class CsLPC(UseCase):
                                     "scopeType": "activePowerLimit"}
 
     def __init__(self, local_entity, on_event: UseCaseEventCallback | None = None, *,
+                 failsafe_limit: float,
+                 failsafe_duration: float = FAILSAFE_DURATION_MIN,
                  approve_limit: LimitApproval | None = None,
                  approve_configuration: ConfigurationApproval | None = None,
+                 autonomous_after_init: bool = False,
                  heartbeat_timeout: float = HEARTBEAT_TIMEOUT_SECONDS,
                  clock: Callable[[], float] = time.monotonic) -> None:
+        """``failsafe_limit`` (W) and ``failsafe_duration`` (s, 2-24 h) are the start values
+        until the Energy Guard writes its own; the failsafe limit applies in init and failsafe.
+        ``autonomous_after_init``: leave init for unlimited/autonomous if no heartbeat and
+        limit came within the heartbeat timeout (allowed by LPC-906); default: stay in init."""
+        if failsafe_limit < 0:
+            raise ValueError("failsafe limit must not be negative")
+        if not FAILSAFE_DURATION_MIN <= failsafe_duration <= FAILSAFE_DURATION_MAX:
+            raise ValueError("failsafe duration must be between 2 and 24 hours")
+        self._initial_failsafe = (float(failsafe_limit), float(failsafe_duration))
         super().__init__(local_entity, on_event)
         self.approve_limit = approve_limit
         self.approve_configuration = approve_configuration
         self.clock = clock
-        self.machine = LPCStateMachine(heartbeat_timeout, clock())
+        self.machine = LPCStateMachine(heartbeat_timeout, clock(), autonomous_after_init)
         self._heartbeat_feature: RemoteFeature | None = None
         self._several_guards = False  # KEO workaround: several entities with DeviceDiagnosis
         self._guard: tuple[str, RemoteEntity | None] = ("", None)
@@ -258,8 +299,9 @@ class CsLPC(UseCase):
         add_write_approval(dc, self._approve_configuration_write)
         descs = as_list((dc.data.get(FN_CONFIG_DESCRIPTIONS) or {}).get(
             "deviceConfigurationKeyValueDescriptionData"))
-        for key, value_type, initial in ((KEY_FAILSAFE_POWER, "scaledNumber", scaled_number(0)),
-                                         (KEY_FAILSAFE_DURATION, "duration", format_duration(0))):
+        power, duration = self._initial_failsafe
+        for key, value_type, initial in ((KEY_FAILSAFE_POWER, "scaledNumber", scaled_number(power)),
+                                         (KEY_FAILSAFE_DURATION, "duration", format_duration(duration))):
             if filter_items(descs, keyName=key):
                 continue
             desc = {"keyId": next_id(descs, "keyId"), "keyName": key, "valueType": value_type}
@@ -440,9 +482,11 @@ class CsLPC(UseCase):
         item = items[-1]
         current = self._limit_item() or {}
         if current.get("isLimitChangeable") is False:
+            self._limit_denied()
             return SpineError(ErrorNumber.COMMAND_REJECTED, "limit is not changeable")
         limit = self._load_limit(item)
         if "value" in item and (scaled_value(item.get("value")) is None or limit.value < 0):
+            self._limit_denied()
             return SpineError(ErrorNumber.COMMAND_REJECTED, "invalid limit value")
         if "value" not in item:
             limit.value = scaled_value(current.get("value")) or 0.0
@@ -453,9 +497,17 @@ class CsLPC(UseCase):
                 _LOGGER.exception("limit approval failed")
                 reason = "approval failed"
             if reason is not None:
+                self._limit_denied()
                 return SpineError(ErrorNumber.COMMAND_REJECTED, reason or "denied")
         self._written = item
         return None
+
+    def _limit_denied(self) -> None:
+        # a denied write still counts for leaving init, failsafe or unlimited/autonomous
+        before = self.machine.state
+        if self.machine.limit(self.clock(), False, None, None, self._failsafe_duration(),
+                              accepted=False):
+            self._state_changed(before)
 
     # --- scenario 2: failsafe values ----------------------------------------------------------
 
@@ -581,7 +633,7 @@ class CsLPC(UseCase):
             try:
                 return self.failsafe_consumption_limit()[0]
             except DataNotAvailable:
-                return 0.0
+                return self._initial_failsafe[0]
         if self.machine.state == LPCState.LIMITED:
             return self.machine.limit_value
         return None
