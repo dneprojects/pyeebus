@@ -1,0 +1,37 @@
+# Changelog
+
+## 0.2.0 (2026-11-18)
+
+### Added
+- **CS-LPC**, the Controllable System side of limitation of power consumption, in
+  `pyeebus.usecases.cs`: active power limit, failsafe limit and duration, heartbeat and
+  nominal maximum, with approval callbacks for writes of the Energy Guard. `CsLPC` also runs
+  the LPC 1.0.0 state machine (init, unlimited/controlled, limited, failsafe,
+  unlimited/autonomous), so the application only applies `effective_limit()`. Tested against
+  eebus-go's Energy Guard. Contributed by [@dneprojects](https://github.com/dneprojects)
+  ([#2](https://github.com/frane/pyeebus/pull/2)).
+- eebus-go interop harness: Energy Guard mode writes failsafe values and stops/starts its
+  heartbeat; Docker build instructions (@dneprojects).
+
+## 0.1.2 (2026-11-17)
+
+First release on PyPI (`pip install pyeebus`).
+
+### Fixed
+- OPEV: an empty permitted value set is unknown, not a maximum of 0 A. First-generation Elli
+  wallboxes send these right after plug-in.
+
+## 0.1.1 (2026-11-03)
+
+### Fixed
+- Wallbox certificates that are not strict DER (BasicConstraints `cA` as `0x01`, seen on
+  first-generation Elli wallboxes) are accepted; the SKI is still checked against the key.
+- No blocking file access in the event loop: TLS contexts are built once in a thread, the
+  trust store is written in the executor and only when it changes.
+
+## 0.1.0 (2026-10-09)
+
+First release: SHIP (certificates, TLS websocket, handshake, mDNS), SPINE (devices,
+entities, features, discovery, subscriptions, bindings, partial updates, heartbeat), the CEM
+use cases for EV charging (EVSECC, EVCC, EVCEM, OPEV, OSCEV, EVSOC) and LPC/MPC as Energy Guard
+and Monitoring Appliance, tested against ship-go, spine-go and eebus-go.
