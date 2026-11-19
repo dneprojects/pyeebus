@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 (2026-11-19)
+
+### Added
+- **MU-MPC**, the Monitored Unit side of monitoring of power consumption, in
+  `pyeebus.usecases.mu`: a device publishes its power (total and per phase), energy consumed
+  and produced, currents, voltages (per phase and phase to phase) and frequency for an Energy
+  Guard or another Monitoring Appliance, with `MuMPC.update(...)`. Set up before `CsLPC`, the
+  LPC limit refers to its power measurement. Tested against eebus-go's Monitoring Appliance.
+  Contributed by [@dneprojects](https://github.com/dneprojects)
+  ([#3](https://github.com/frane/pyeebus/pull/3)).
+
+### Fixed
+- MA-MPC: a phase-to-phase voltage (e.g. a to b) no longer replaces the voltage of phase a
+  (@dneprojects, #3).
+
 ## 0.2.0 (2026-11-18)
 
 ### Added
