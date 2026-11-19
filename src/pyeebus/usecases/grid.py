@@ -50,6 +50,7 @@ FN_MEAS_CONSTRAINTS = "measurementConstraintsListData"
 FN_MEASUREMENTS = "measurementListData"
 
 KEY_FAILSAFE_POWER = "failsafeConsumptionActivePowerLimit"
+KEY_FAILSAFE_PRODUCTION = "failsafeProductionActivePowerLimit"
 KEY_FAILSAFE_DURATION = "failsafeDurationMinimum"
 
 
@@ -90,17 +91,19 @@ class LPC(UseCase):
 
     LIMIT_FILTER: ClassVar[dict[str, str]] = {"limitType": "signDependentAbsValueLimit", "limitDirection": "consume",
                     "scopeType": "activePowerLimit"}
+    KEY_FAILSAFE_POWER = KEY_FAILSAFE_POWER
+    CHARACTERISTIC_CEM = "contractualConsumptionNominalMax"
+    CHARACTERISTIC_DEVICE = "powerConsumptionNominalMax"
 
     def add_features(self) -> None:
         super().add_features()
         feature = self.local.add_feature(DEVICE_DIAGNOSIS, Role.SERVER)
         feature.add_function(FN_HEARTBEAT, read=True)
 
-    @staticmethod
-    def _characteristic_type(entity: RemoteEntity | None) -> str:
+    def _characteristic_type(self, entity: RemoteEntity | None) -> str:
         if entity is not None and entity.type == "CEM":
-            return "contractualConsumptionNominalMax"
-        return "powerConsumptionNominalMax"
+            return self.CHARACTERISTIC_CEM
+        return self.CHARACTERISTIC_DEVICE
 
     def handle_entity_event(self, event: Event) -> None:
         entity = event.entity
@@ -215,7 +218,7 @@ class LPC(UseCase):
 
     def failsafe_consumption_limit(self, entity: RemoteEntity) -> float:
         """Failsafe active power limit (W) used when the energy guard is gone."""
-        _f, _desc, value = self._config(entity, KEY_FAILSAFE_POWER)
+        _f, _desc, value = self._config(entity, self.KEY_FAILSAFE_POWER)
         number = ((value or {}).get("value") or {}).get("scaledNumber")
         if scaled_value(number) is None:
             raise DataNotAvailable("no failsafe limit")
@@ -245,7 +248,7 @@ class LPC(UseCase):
 
     async def write_failsafe_consumption_limit(self, entity: RemoteEntity, watts: float,
                                                timeout: float | None = None) -> None:
-        await self._write_config(entity, KEY_FAILSAFE_POWER, {"scaledNumber": scaled_number(watts)}, timeout)
+        await self._write_config(entity, self.KEY_FAILSAFE_POWER, {"scaledNumber": scaled_number(watts)}, timeout)
 
     async def write_failsafe_duration_minimum(self, entity: RemoteEntity, seconds: float,
                                               timeout: float | None = None) -> None:
@@ -275,6 +278,30 @@ class LPC(UseCase):
         if not items or scaled_value(items[0].get("value")) is None:
             raise DataNotAvailable("no nominal maximum")
         return scaled_value(items[0]["value"])
+
+
+class LPP(LPC):
+    """Limitation of power production (feed-in), Energy Guard side (eebus-go eg/lpp).
+
+    The same as :class:`LPC` with the production direction; the LPC method names
+    work too (``consumption_limit`` is the production limit here).
+    """
+
+    name = "limitationOfPowerProduction"
+    valid_entity_types = ("CEM", "EVSE", "Inverter", "SmartEnergyAppliance", "SubMeterElectricity")
+    LIMIT_FILTER: ClassVar[dict[str, str]] = {"limitType": "signDependentAbsValueLimit", "limitDirection": "produce",
+                    "scopeType": "activePowerLimit"}
+    KEY_FAILSAFE_POWER = KEY_FAILSAFE_PRODUCTION
+    CHARACTERISTIC_CEM = "contractualProductionNominalMax"
+    CHARACTERISTIC_DEVICE = "powerProductionNominalMax"
+    DATA_UPDATE_FAILSAFE_POWER = "DataUpdateFailsafeProductionActivePowerLimit"
+    DATA_UPDATE_NOMINAL_MAX = "DataUpdatePowerProductionNominalMax"
+
+    production_limit = LPC.consumption_limit
+    write_production_limit = LPC.write_consumption_limit
+    failsafe_production_limit = LPC.failsafe_consumption_limit
+    write_failsafe_production_limit = LPC.write_failsafe_consumption_limit
+    production_nominal_max = LPC.consumption_nominal_max
 
 
 # --- MPC -----------------------------------------------------------------------------------
