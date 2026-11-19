@@ -350,6 +350,8 @@ class MPC(UseCase):
             param = next((p for p in params if p.get("measurementId") == item.get("measurementId")), None)
             if phases is not None and (param is None or param.get("acMeasuredPhases") not in phases):
                 continue
+            if phases is not None and param.get("acMeasuredInReferenceTo") in PHASES:
+                continue  # phase-to-phase voltage (e.g. a to b), not the value of phase a
             if direction:
                 connection = next((c for c in connections if param is not None and
                                    c.get("electricalConnectionId") == param.get("electricalConnectionId")), None)
