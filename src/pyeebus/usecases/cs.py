@@ -106,7 +106,7 @@ class LimitationState:
 @dataclass
 class LimitationStateMachine:
     """The LPC/LPP states of a Controllable System (LPC 1.0.0, LPP 1.0.0), driven with
-    monotonic timestamps. The requirement IDs are LPC's; LPP 1.0.0 is taken to work the same way.
+    monotonic timestamps. The requirement IDs are LPC's; LPP's are the same ([LPP-901] ... [LPP-923]).
 
     * init (after start): the failsafe limit applies. Without heartbeat and limit
       the CS stays in init, or with ``autonomous_after_init`` goes to
@@ -240,6 +240,9 @@ class CsPowerLimitation(UseCase):
     client_features = (DEVICE_DIAGNOSIS,)
 
     DIRECTION = ""
+    SIGN = 1
+    """Sign of the active power limit on the wire: LPP uses the passive sign convention, its
+    limit is <= 0 W [LPP-001]; the Python API always uses positive watts."""
     KEY_FAILSAFE_POWER = ""
     CHARACTERISTIC_HEMS = ""
     CHARACTERISTIC_DEVICE = ""
@@ -453,7 +456,7 @@ class CsPowerLimitation(UseCase):
         item = self._limit_item()
         if item is None or scaled_value(item.get("value")) is None:
             raise DataNotAvailable("no limit value")
-        limit = LoadLimit(scaled_value(item["value"]), bool(item.get("isLimitActive")),
+        limit = LoadLimit(self._from_wire(scaled_value(item["value"])), bool(item.get("isLimitActive")),
                           bool(item.get("isLimitChangeable")))
         end = (item.get("timePeriod") or {}).get("endTime")
         if end:
@@ -469,16 +472,23 @@ class CsPowerLimitation(UseCase):
         Does not drive the state machine: only limits from the Energy Guard do.
         """
         item: dict[str, Any] = {"limitId": self._limit_id(), "isLimitChangeable": limit.is_changeable,
-                                "isLimitActive": limit.is_active, "value": scaled_number(limit.value)}
+                                "isLimitActive": limit.is_active,
+                                "value": scaled_number(self._to_wire(limit.value))}
         delete: tuple[str, ...] = ("timePeriod",)
         if limit.duration and limit.duration > 0:
             item["timePeriod"] = {"endTime": format_duration(limit.duration)}
             delete = ()
         self._update_limit_item(item, delete)
 
-    @staticmethod
-    def _load_limit(item: dict[str, Any]) -> LoadLimit:
-        limit = LoadLimit(scaled_value(item.get("value")) or 0.0, bool(item.get("isLimitActive")))
+    def _to_wire(self, watts: float) -> float:
+        return -watts if self.SIGN < 0 and watts else watts
+
+    def _from_wire(self, value: float) -> float:
+        return -value if self.SIGN < 0 and value else value
+
+    def _load_limit(self, item: dict[str, Any]) -> LoadLimit:
+        limit = LoadLimit(self._from_wire(scaled_value(item.get("value")) or 0.0),
+                          bool(item.get("isLimitActive")))
         end = (item.get("timePeriod") or {}).get("endTime")
         if end:
             with contextlib.suppress(ValueError):
@@ -503,7 +513,7 @@ class CsPowerLimitation(UseCase):
             self._limit_denied()
             return SpineError(ErrorNumber.COMMAND_REJECTED, "invalid limit value")
         if "value" not in item:
-            limit.value = scaled_value(current.get("value")) or 0.0
+            limit.value = self._from_wire(scaled_value(current.get("value")) or 0.0)
         if self.approve_limit is not None:
             try:
                 reason = self.approve_limit(limit)
@@ -803,10 +813,12 @@ class CsLPC(CsPowerLimitation):
 
 class CsLPP(CsPowerLimitation):
     """Limitation of power production (LPP, e.g. a feed-in limit), Controllable System actor
-    (eebus-go cs/lpp). Limits are positive values in W of produced power."""
+    (eebus-go cs/lpp). The API uses positive watts of production; on the wire the limit is
+    negative [LPP-001], a positive one is rejected. Failsafe limit and nominal max are >= 0."""
 
     name = "limitationOfPowerProduction"
     DIRECTION = "produce"
+    SIGN = -1
     KEY_FAILSAFE_POWER = KEY_FAILSAFE_PRODUCTION
     CHARACTERISTIC_HEMS = "contractualProductionNominalMax"
     CHARACTERISTIC_DEVICE = "powerProductionNominalMax"

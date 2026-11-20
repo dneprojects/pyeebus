@@ -366,22 +366,27 @@ async def test_eebus_go_energy_guard_limits_pyeebus_production():
         await cs.node.connect("127.0.0.1", port, go_ski)
 
         assert await harness.expect("EG_ENTITY") == "EG_ENTITY Inverter"
-        assert await harness.expect("EGP_LIMIT") == "EGP_LIMIT 10000 false true"
+        assert await harness.expect("EGP_LIMIT") == "EGP_LIMIT -10000 false true"  # LPP: <= 0 on the wire
         assert await harness.expect("EGP_FAILSAFE") == "EGP_FAILSAFE 6000"
         await harness.send("pnominal")
         assert await harness.expect("EGP_NOMINAL_MAX") == "EGP_NOMINAL_MAX 10000"
         await wait_for(lpp.is_heartbeat_within_duration, timeout=15)
         assert (lpp.state, lpp.effective_limit()) == (LimitationState.INIT, 6000)
 
-        await harness.send("plimit 4000 3600")
+        await harness.send("plimit -4000 3600")
         assert await harness.expect("PWRITE_RESULT") == "PWRITE_RESULT 0"
         assert approvals[-1] == LoadLimit(4000, True, duration=3600)
         assert await wait_for(lambda: lpp.state == LimitationState.LIMITED)
         assert lpp.effective_limit() == 4000
-        await harness.expect("EGP_LIMIT 4000 true")
+        await harness.expect("EGP_LIMIT -4000 true")
 
         harness.lines.clear()
-        await harness.send("plimit 12000")
+        await harness.send("plimit 4000")  # a positive production limit is invalid [LPP-001]
+        assert await harness.expect("PWRITE_RESULT") == "PWRITE_RESULT 7"
+        assert lpp.production_limit().value == 4000
+
+        harness.lines.clear()
+        await harness.send("plimit -12000")
         assert await harness.expect("PWRITE_RESULT") == "PWRITE_RESULT 7"
         assert lpp.production_limit().value == 4000
 

@@ -92,6 +92,7 @@ class LPC(UseCase):
     LIMIT_FILTER: ClassVar[dict[str, str]] = {"limitType": "signDependentAbsValueLimit", "limitDirection": "consume",
                     "scopeType": "activePowerLimit"}
     KEY_FAILSAFE_POWER = KEY_FAILSAFE_POWER
+    SIGN = 1  # LPP: -1, its limit is <= 0 W on the wire [LPP-001]
     CHARACTERISTIC_CEM = "contractualConsumptionNominalMax"
     CHARACTERISTIC_DEVICE = "powerConsumptionNominalMax"
 
@@ -173,7 +174,10 @@ class LPC(UseCase):
                     duration = (parse_datetime(end) - utcnow()).total_seconds()
                 except ValueError:
                     duration = None
-        return LoadLimit(scaled_value(item["value"]), bool(item.get("isLimitActive")),
+        value = scaled_value(item["value"])
+        if self.SIGN < 0:
+            value = abs(value)  # positive watts of production in the API
+        return LoadLimit(value, bool(item.get("isLimitActive")),
                          bool(item.get("isLimitChangeable")), duration)
 
     async def write_consumption_limit(self, entity: RemoteEntity, limit: LoadLimit,
@@ -187,7 +191,8 @@ class LPC(UseCase):
         if current[0].get("isLimitChangeable") is False:
             raise DataNotAvailable("the limit is not changeable")
         item: dict[str, Any] = {"limitId": desc["limitId"], "isLimitActive": limit.is_active,
-                                "value": scaled_number(limit.value)}
+                                "value": scaled_number(-abs(limit.value) if self.SIGN < 0 and limit.value
+                                                       else limit.value)}
         if limit.duration and limit.duration > 0:
             item["timePeriod"] = {"endTime": format_duration(limit.duration)}
         filters = []
@@ -284,7 +289,9 @@ class LPP(LPC):
     """Limitation of power production (feed-in), Energy Guard side (eebus-go eg/lpp).
 
     The same as :class:`LPC` with the production direction; the LPC method names
-    work too (``consumption_limit`` is the production limit here).
+    work too (``consumption_limit`` is the production limit here). The API uses positive
+    watts of production; on the wire the limit is negative [LPP-001]. Failsafe limit and
+    nominal max are >= 0.
     """
 
     name = "limitationOfPowerProduction"
@@ -292,6 +299,7 @@ class LPP(LPC):
     LIMIT_FILTER: ClassVar[dict[str, str]] = {"limitType": "signDependentAbsValueLimit", "limitDirection": "produce",
                     "scopeType": "activePowerLimit"}
     KEY_FAILSAFE_POWER = KEY_FAILSAFE_PRODUCTION
+    SIGN = -1
     CHARACTERISTIC_CEM = "contractualProductionNominalMax"
     CHARACTERISTIC_DEVICE = "powerProductionNominalMax"
     DATA_UPDATE_FAILSAFE_POWER = "DataUpdateFailsafeProductionActivePowerLimit"

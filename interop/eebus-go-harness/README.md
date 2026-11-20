@@ -14,7 +14,7 @@ EEBUS_GO_HARNESS=$PWD/harness pytest ../../tests/test_interop_eebus_go.py
 
 `-mode cem|evse|lpc|eg -port N -trust <SKI>`; in EVSE mode, stdin takes `plug`, `unplug`,
 `measure <A> <Wh>` and `quit`; in LPC mode `power <W>`; in Energy Guard mode `limit <W> [s]`,
-`release`, `failsafe <W>`, `failsafeduration <s>`, `heartbeat stop|start` and `nominal`, for LPP `plimit <W> [s]`, `prelease`, `pfailsafe <W>`
+`release`, `failsafe <W>`, `failsafeduration <s>`, `heartbeat stop|start` and `nominal`, for LPP `plimit <W> [s]` (the wire value, <= 0 by LPP's sign convention), `prelease`, `pfailsafe <W>`
 and `pnominal`.
 
 Without a local Go toolchain, build with Docker (for Windows add `-e GOOS=windows` and

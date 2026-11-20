@@ -8,7 +8,7 @@ import pytest
 
 from pyeebus.service import EebusService
 from pyeebus.ship import Identity
-from pyeebus.spine.model import SpineError
+from pyeebus.spine.model import SpineError, scaled_number, scaled_value
 from pyeebus.usecases import (
     LPC,
     LPP,
@@ -82,6 +82,9 @@ async def test_local_lpp_next_to_lpc():
         assert lpc.failsafe_duration_minimum() == (4 * 3600, True)
         lpp.set_production_limit(LoadLimit(7000, is_active=False))
         assert lpp.production_limit() == LoadLimit(7000, is_active=False)
+        # LPP's passive sign convention: the limit is <= 0 on the wire [LPP-001]
+        items = lc.data["loadControlLimitListData"]["loadControlLimitData"]
+        assert {i["limitId"]: scaled_value(i["value"]) for i in items} == {0: 0, 1: -7000}
         assert lpc.consumption_limit().value == 0
         assert (lpp.state, lpp.effective_limit()) == (LimitationState.INIT, 6000)
         use_cases = cs.device.node_management.data["nodeManagementUseCaseData"]["useCaseInformation"]
@@ -143,8 +146,11 @@ async def test_energy_guard_controls_production(guard_and_cs):
     assert (lpp.state, lpp.effective_limit()) == (LimitationState.UNLIMITED_CONTROLLED, None)
     assert lpc.state == LimitationState.INIT
 
-    # a feed-in limit only changes LPP
+    # a feed-in limit only changes LPP; it goes negative on the wire and the guard reads it back
     await eg_lpp.write_production_limit(entity, LoadLimit(4000, True))
+    assert lpp._limit_item()["value"] == scaled_number(-4000)
+    assert (await wait_for(lambda: eg_lpp.production_limit(entity).is_active and
+                           eg_lpp.production_limit(entity))).value == 4000
     assert (lpp.state, lpp.effective_limit()) == (LimitationState.LIMITED, 4000)
     assert lpc.state == LimitationState.INIT
     assert lpc.consumption_limit().value == 0

@@ -61,7 +61,7 @@ await opev.write_load_control_limits(ev, [PhaseLimit(p, 10) for p in "abc"])   #
 
 For devices that offer power limitation (LPC, e.g. wallboxes with §14a EnWG support) use `LPC` and `MPC`: `await lpc.write_consumption_limit(evse, LoadLimit(4200, duration=3600))`, `mpc.power(evse)`, `mpc.energy_consumed(evse)`.
 
-To act as the controllable system yourself (a device behind a §14a EnWG control box), use `CsLPC` (and `CsLPP` for a feed-in limit, the same API with `production_*` names). Incoming limits and failsafe values go through your approval callbacks; the built-in state machine (LPC/LPP 1.0.0) handles init, heartbeat timeout (failsafe), failsafe duration and limit durations, so you only apply `effective_limit()` (W, `None` = no limit) whenever `STATE_CHANGED` comes. The failsafe limit is required: it applies from the start (init) until the Energy Guard states a limit:
+To act as the controllable system yourself (a device behind a §14a EnWG control box), use `CsLPC` (and `CsLPP` for a feed-in limit, the same API with `production_*` names and positive watts; pyeebus puts LPP's negative sign on the wire). Incoming limits and failsafe values go through your approval callbacks; the built-in state machine (LPC/LPP 1.0.0) handles init, heartbeat timeout (failsafe), failsafe duration and limit durations, so you only apply `effective_limit()` (W, `None` = no limit) whenever `STATE_CHANGED` comes. The failsafe limit is required: it applies from the start (init) until the Energy Guard states a limit:
 
 ```python
 mpc = MuMPC(service.entities[0], power=MonitorPowerConfig("abc"),
